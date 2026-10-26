@@ -7,7 +7,7 @@ import { Context } from '@deepseek-ai/cordis'
 import Loader, { type Entry } from '@deepseek-ai/cordis-plugin-loader'
 import Include, { applyEntryPatches, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { createMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { SessionId, type Session } from '@deepseek-ai/dsh-session'
 import { parse, stringify } from 'yaml'
 
@@ -75,13 +75,37 @@ async function boot(patches: PatchOptions[] = []) {
   if (entry === undefined) throw new Error('Shipped bundle did not contribute a semi-auto Loader entry')
   expect(ctx.get('loaderFixture'), 'real DSH service fixture must finish mounting').toBeDefined()
 
-  const execute = () => {
+  let step = 0
+  const execute = (elevated = false) => {
     const session = ctx.loaderFixture.session
-    // Authorization is exercised through real ToolRuntime dispatch; a running
-    // model loop is unnecessary for the explicit direct-human decision.
     const agent = { id: session.id, session, ctx, options: { provider: 'fixture', model: 'fixture' } } as Agent
+    const callId = ToolCallId(`loader-probe-${++step}`)
+    const args = elevated ? { sandbox_permissions: 'danger-full-access', justification: 'Test one native approval' } : {}
+    const argumentsJson = JSON.stringify(args)
+    if (session.requestHeader() === undefined) {
+      session.append('turn/start', { turn: 1 })
+      session.append('request/header', {
+        header: {
+          config: { provider: 'fixture', model: 'fixture' },
+          tools: [{
+            name: 'loader_probe', description: 'Count Loader tool dispatches',
+            parameters: { type: 'object', properties: { sandbox_permissions: { type: 'string' }, justification: { type: 'string' } } },
+          }],
+        },
+        reason: 'initial',
+      })
+    }
+    session.append('step/start', { turn: 1, step })
+    session.append('assistant/message', {
+      turn: 1, step, stream: [],
+      message: createMessage({
+        role: 'assistant', source: { kind: 'model', provider: 'fixture', model: 'fixture' },
+        content: [{ type: 'tool-call', id: callId, name: 'loader_probe', arguments: argumentsJson }],
+      }),
+    }, { surfaceOp: 'append' })
+    session.append('tool/call', { turn: 1, step, callId, name: 'loader_probe', arguments: argumentsJson })
     return ctx.tools.execute({
-      name: 'loader_probe', arguments: {}, callId: ToolCallId('loader-probe'),
+      name: 'loader_probe', arguments: args, callId,
       agent, signal: new AbortController().signal,
     })
   }
@@ -96,7 +120,7 @@ async function enable(entry: Entry, permissionPopupPath: string) {
 
 function expectPolicy(ctx: Context, session: Session, approval: 'ask' | 'never') {
   expect(ctx.sandboxPolicy.resolve({ session }).mode).toBe('workspace-write')
-  expect(ctx.approval.overrideOf(session)).toBe(approval)
+  expect(ctx.approval.overrideOf(session) ?? ctx.approval.config.policy).toBe(approval)
 }
 
 afterEach(async () => {
@@ -139,29 +163,26 @@ describe('built Semi Auto through real Cordis Loader and Include', () => {
     expect(h.configured.find(row => row.id === 'semi-auto')?.config).toEqual({
       permissionPopupPath: '/test/unused-permission-popup',
     })
-    expectPolicy(h.ctx, h.ctx.loaderFixture.session, 'never')
+    expectPolicy(h.ctx, h.ctx.loaderFixture.session, 'ask')
     const fresh = h.ctx.sessions.create(SessionId('loader-fresh'), {
       meta: { cwd: dirname(h.popupPath) },
     })
-    expectPolicy(h.ctx, fresh, 'never')
+    expectPolicy(h.ctx, fresh, 'ask')
     await h.entry.fiber!.dispose()
     expectPolicy(h.ctx, fresh, 'ask')
     expectPolicy(h.ctx, h.ctx.loaderFixture.session, 'ask')
   })
 
-  it('enables, dispatches through the native popup adapter, disables and re-enables the same Loader entry', async () => {
+  it('reviews confined calls without popup across enable, disable and re-enable', async () => {
     const h = await boot()
     const session = h.ctx.loaderFixture.session
     await enable(h.entry, h.popupPath)
-    expectPolicy(h.ctx, session, 'never')
-    expect((await h.execute()).isError).toBe(false)
+    expectPolicy(h.ctx, session, 'ask')
+    const result = await h.execute()
+    expect(result.isError, JSON.stringify(result)).toBe(false)
     expect(h.ctx.loaderFixture.calls).toBe(1)
-    expect(h.ctx.loaderFixture.reviews).toBe(0)
-    const request = JSON.parse((await readFile(h.requestsPath, 'utf8')).trim())
-    expect(request).toMatchObject({
-      session_id: session.id, hook_event_name: 'PermissionRequest',
-      tool_name: 'loader_probe', tool_input: {},
-    })
+    expect(h.ctx.loaderFixture.reviews).toBe(1)
+    await expect(readFile(h.requestsPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
 
     const fiber = h.entry.fiber!
     await h.entry.update({ disabled: true })
@@ -171,14 +192,36 @@ describe('built Semi Auto through real Cordis Loader and Include', () => {
     expect(h.ctx.permissionPresets.current(session)).toBe('workspace-write')
     expect((await h.execute()).isError).toBe(false)
     expect(h.ctx.loaderFixture.calls).toBe(2)
-    expect((await readFile(h.requestsPath, 'utf8')).trim().split('\n')).toHaveLength(1)
+    expect(h.ctx.loaderFixture.reviews).toBe(1)
 
     await enable(h.entry, h.popupPath)
-    expectPolicy(h.ctx, session, 'never')
+    expectPolicy(h.ctx, session, 'ask')
     expect((await h.execute()).isError).toBe(false)
     expect(h.ctx.loaderFixture.calls).toBe(3)
-    expect((await readFile(h.requestsPath, 'utf8')).trim().split('\n')).toHaveLength(2)
+    expect(h.ctx.loaderFixture.reviews).toBe(2)
+    await expect(readFile(h.requestsPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
     await h.entry.fiber!.dispose()
     expectPolicy(h.ctx, session, 'ask')
+  })
+
+  it('opens the built popup adapter only for a native one-shot escalation', async () => {
+    const h = await boot()
+    const session = h.ctx.loaderFixture.session
+    await enable(h.entry, h.popupPath)
+    const elevated = await h.execute(true)
+    expect(elevated.isError, JSON.stringify(elevated)).toBe(false)
+    expect(h.ctx.loaderFixture.calls).toBe(1)
+    expect(h.ctx.loaderFixture.reviews).toBe(0)
+    expectPolicy(h.ctx, session, 'ask')
+    const request = JSON.parse((await readFile(h.requestsPath, 'utf8')).trim())
+    expect(request).toMatchObject({
+      session_id: session.id, hook_event_name: 'PermissionRequest',
+      tool_name: 'loader_probe',
+      tool_input: { sandbox_permissions: 'danger-full-access', justification: 'Test one native approval' },
+    })
+    expect((await h.execute()).isError).toBe(false)
+    expect(h.ctx.loaderFixture.calls).toBe(2)
+    expect(h.ctx.loaderFixture.reviews).toBe(1)
+    expect((await readFile(h.requestsPath, 'utf8')).trim().split('\n')).toHaveLength(1)
   })
 })

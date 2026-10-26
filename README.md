@@ -1,39 +1,69 @@
 # dsh-semi-auto
 
-在当前 DeepSeek Harness profile 中增加原生人工 popup 和 Auto review，
-执行继续受 DSH 原生选择的 `read-only` 或 `workspace-write` 文件 sandbox 限制。
+在当前 DeepSeek Harness profile 中增加 Auto review，
+仅在原生一次性提权审批出现时打开人工 popup。
+保留原生 `read-only`／`workspace-write` sandbox 和 approval policy 选择，
 不修改上游源码，不替换权限服务或子代理服务，也不新增 permission preset。
 
 ## 行为
 
-启用插件后，当前 profile 中已加载和新创建的会话仅将 approval 改成 `never`。
-原生 `read-only` 或 `workspace-write` sandbox 选择保持不变；两者之间仍可通过原生菜单切换。
-插件对官方 Auto 的候选调用全局生效，不依赖会话 preset 身份。
-因此同进程 spawn、fork 和 Teams 的调用不需要继承新的 permission preset。
-权限菜单可能显示 `Custom`，这是原生权限组合的显示结果，不代表插件未运行。
+普通 sandbox 内调用只做 Auto review，不弹 popup。
+只有工具实际向原生审批服务请求一次性扩大权限时，才弹 popup；
+插件不会仅因参数里出现 `sandbox_permissions` 就提前弹窗。
+启用和关闭都不写入 sandbox 或 approval policy，
+原生 `read-only`／`workspace-write` 选择及 `ask`／`never` 决策保持有效。
 
 ```text
-pending tool call
+普通 sandbox 调用
+  → vendored official Auto reviewer → downstream policies → sandboxed execution
+
+原生有效提权审批
   → permission-popup --host dsh
-      ├─ Auto review / allow
-      │    → vendored official Auto reviewer → downstream policies → sandboxed execution
-      ├─ Authorize / allow_direct
-      │    → downstream policies → sandboxed execution
-      └─ Deny / invalid output / failure / timeout
-           → deny
+      ├─ Auto review / allow → vendored official Auto reviewer → allowed-once
+      ├─ Authorize / allow_direct → allowed-once
+      └─ Deny / invalid output / failure / timeout → reject
 ```
 
-- `Authorize` 只跳过 Auto reviewer，不跳过其他拒绝策略或文件 sandbox。
-- `Auto review` 每次使用当前会话最新持久化 request header 的 provider/model。
-  它增加一次 LLM 请求，不提供缓存或自动重试。
+- 原生审批服务继续负责审计和 `allowed-once` 的范围。
+  允许 `danger-full-access` 后，本次操作确实可以在原 sandbox 外执行；
+  它不是只允许进入审核，也不改变会话之后的长期 sandbox。
+  `read-only → workspace-write` 同样是需要原生审批的扩大权限，虽然并非完全无 sandbox。
+- `Authorize` 只跳过这次提权的 Auto reviewer，不跳过其他拒绝策略。
+  它不撤销此前已经发生的审核拒绝。
+- `Auto review` 使用当前会话最新持久化 request header 的 provider/model。
+  每次审核增加一次 LLM 请求，不提供缓存或自动重试。
 - 人工拒绝、Auto 拒绝和 reviewer 故障均为最终拒绝，不打开内置二次审批。
-- 明确的 `sandbox_permissions` 请求被拒绝；不能获得 one-shot full access。
-- 外层 `run_code` 和官方 Auto 一样不弹窗、不审查；每个实际开始的 inner tool call 单独审核。
-  `run_code` 内直接使用 Node API 的效果仅由原生 PTC sandbox 约束，不逐项弹窗。
-- 空 stdout 也拒绝：关闭 popup 的托盘开关并不等于关闭本插件。
-- 审核或排队期间权限发生不兼容变化，会取消本次授权，即使之后又切回原值。
+  缺失或无效提权参数仍先按普通调用做 Auto，再由原生工具验证；重复当前 mode 不需要提权弹窗。
+  只有可信工具定义明确声明 `sandbox_permissions` 和 `justification` 时，才能将 Auto 延后到实际审批。
+  普通工具多带这两个参数不能跳过 Auto。
+- 没有声明原生提权参数的隐式审批暂不接管，默认拒绝且不回退内置审批。
+  例如 `plugin_manager` 的内部 full-access 审批不受支持；请通过 GUI 管理插件。
+  这也避免从正在运行的工具中卸载其自身审核插件产生清理等待。
+- sandbox 拒绝本身不会自动重试或弹窗；代理必须按原生规则显式重试，
+  同时提供有效的 `sandbox_permissions` 和 `justification`。
+- 普通外层 `run_code` 和官方 Auto 一样不弹窗、不审查；每个实际开始的 inner tool call 单独做 Auto。
+  如果外层 `run_code` 自身请求扩大权限，则 popup 和 Auto review 的对象是整个待执行程序，
+  不能按普通 transport 跳过；获准范围可能覆盖该次完整程序。
+  普通 `run_code` 内直接使用 Node API 的效果仅由原生 PTC sandbox 约束，不逐项审核。
+- 原生 `never` 在审批 answerer 之前直接拒绝，因而不会弹 popup。
+  同进程子代理原生继承的 `never` 也保持不变；插件不自动放宽其提权权限。
+- 审核或排队期间 sandbox／approval 变化，会取消本次授权，即使之后又切回原值。
 - 宿主日志只记录 session/call/tool/result，不额外记录参数、reviewer reasoning 或 prompt。
   工具调用自身仍按 DSH 原有机制持久化。
+
+### 空响应与 Custom 菜单调查
+
+已复现的无效响应来自 popup 托盘配置 `enabled: false`：
+该状态下 binary 正常退出但 stdout 为空，并非已证明正常 JSON envelope 不兼容。
+插件仍将空或纯空白响应视为拒绝，错误会明确提示检查托盘开关或 popup 配置；
+不能把“没有决定”当成允许。
+
+原生权限 preset 同时匹配 sandbox 和 approval。
+旧实现把 `workspace-write + ask` 改成 `workspace-write + never`，
+因此原生菜单派生为 `Custom`。
+本轮只调查这一问题，不修改 UI、preset 表或匹配规则。
+新审核路径不再覆盖原生 policy，所以正常原生选择可继续按原有规则显示；
+这不是新增的菜单显示修补。
 
 ## 启用与关闭
 
@@ -82,8 +112,8 @@ dsh plugin --profile desktop add /absolute/path/dsh-semi-auto-0.1.0.tgz
 
 关闭会停止新授权，取消 popup/reviewer 和在途工具的生命周期信号，
 等待相关调用完成，再移除拦截器。
-所有仍然加载的受管会话仅将 approval 恢复为 `ask`，保留当时的 sandbox 选择。
-例如 `read-only + never` 回到 `read-only + ask`。
+启用和关闭都不更改会话的 approval 或 sandbox，
+因此关闭后原生权限组合保持当时的选择，而不是统一写回 `ask`。
 如果手动选择了 full access，启用期间调用会被拒绝；关闭后该 sandbox 选择仍然保留，不会由插件偷偷改动。
 官方 Auto 插件的注册和行为不受修改。
 不响应取消的工具可能延迟关闭完成；插件不会提前移除保护或假称已完成清理。
@@ -94,8 +124,11 @@ dsh plugin --profile desktop add /absolute/path/dsh-semi-auto-0.1.0.tgz
 dsh plugin --profile desktop remove dsh-semi-auto
 ```
 
-其他未加载的持久化会话可能仍保留原 sandbox 与 `never`。
-在插件关闭后打开这些会话时，可以通过原生权限菜单重新选择所需的 sandbox preset，恢复原生 approval 配置。
+从旧版 `0.1.0` 的固定 `never` 实现升级时，先停下工具任务并关闭旧 entry，
+待旧插件完成清理、恢复其受管会话的 `ask` 后，再构建并重新启用。
+旧版未加载的持久化会话可能仍保留 `never`；
+重新打开后可通过原生权限菜单明确选择所需 preset，恢复相应原生 policy。
+新版不会把这些 `never` 自动改成 `ask`，以免放宽用户有意设置的限制。
 插件退出或整个进程崩溃不提供“启动时必定存在”的保证，
 重启后必须确认插件 ACTIVE；插件缺席时原生 DSH 不会继续替它运行 popup/Auto。
 
@@ -110,27 +143,31 @@ dsh plugin --profile desktop remove dsh-semi-auto
 
 DSH 的 patch 整体替换 `config`，覆盖其他配置时仍需填写 `permissionPopupPath`。
 popup 自身的默认队列/窗口 deadline 是 540 秒；其环境变量及托盘设置仍由 popup 项目管理。
+提权前请确认 popup 的托盘开关已开启；关闭开关时的空 stdout 会被明确拒绝，
+并提示检查开关，不会回退为允许或内置审批。
 其输入上限是完整 JSON stdin（包含换行）8 MiB。
 
 ## 安全与范围
 
 - popup 是可信宿主 UI，使用本地 `LocalSubprocessRuntime` 直接启动，不经过 agent bash sandbox。
-  待执行工具是另一个操作，继续使用原生 sandbox；两者没有执行权限继承关系。
+  待执行工具是另一个操作；popup 进程本身不携带工具执行权限，
+  真正的一次性扩大权限仍由原生审批服务和调用工具执行。
 - 只接受本地 subprocess provider。
   已注册外部进程型 subagent provider 时，插件会拒绝启用；启用后也拒绝这类 provider 的新增注册。
   请先关闭外部 Codex/Claude/ACP 等 provider 插件，保留同进程 spawn/fork。
 - 插件同时通过 pre-execute、单调 guard 和 execute 阶段检查授权与权限，
   其他普通 pre-execute listener 返回 allow 不能替代本插件的授权。
   同进程恶意插件本来就属于可信宿主代码，不是本插件能隔离的对象。
-- 原生 `read-only` 与 `workspace-write` 选择保持有效，插件只将 `ask` 改为 `never`。
-  菜单变更后的重新固定在事件发布后执行；每次工具授权入口也先固定 `never`，不依赖 UI 更新时序。
-  切换 sandbox 会取消正在审核或排队的调用，下一次调用使用新的原生选择。
+- 原生 `read-only` 与 `workspace-write` 选择及 approval policy 保持有效，不固定 `never`。
+  原生提权 answerer 需要 `ask`；`never` 仍按原生规则在插件弹窗前拒绝。
+  切换 sandbox 或 approval 会取消正在审核或排队的调用，下一次调用使用新的原生选择。
   选择 full access 或原生 Auto 不会关闭本插件，但启用期间调用会被拒绝；需要这些模式时先关闭本插件。
 - `workspace-write` 不是网络隔离，也不限制读取所有工作区外文件。
   原生 filesystem provider 是可信路径检查；bash/PTC 代码由原生 OS sandbox 约束。
   MCP 或其他远端工具的服务端效果不因此被本地文件 sandbox 隔离。
 - 模型审核不保证判断准确。popup 内容是待执行工具的实际参数，不能将其中的文字当作可靠指令。
-- 复制的官方 prompt 保留其 full-host 风险假设；实际执行权限更窄。
+- 复制的官方 prompt 保留其 full-host 风险假设；普通调用实际执行权限由当前 sandbox 限定，
+  获准的提权调用则使用原生工具授予的单次范围。
   本插件不修改其风险策略，源码版本及更新方法见 [UPDATING.md](UPDATING.md)。
 
 ## 开发与验证
@@ -148,9 +185,11 @@ PTC inner-call 校验、真实 filesystem workspace/outside-workspace 写入。
 测试不调用真实 LLM，不自动操作 AppKit 窗口。
 
 手动验收应在实际已加载插件的 profile 中进行：
-分别点击 Auto review、Authorize、Deny，确认 reviewer 请求次数和工具效果；
-再确认 read-only 写入拒绝、workspace-write 的工作区外写入拒绝，
-关闭插件后不再弹窗、approval 恢复 ask，且 sandbox 选择保持不变。
+确认普通 sandbox 调用只做 Auto、不弹窗，sandbox 拒绝不会自动弹窗或重试；
+再提交原生有效提权请求，分别点击 Auto review、Authorize、Deny，确认审核次数和单次工具效果。
+确认 `never` 下的提权不弹窗而直接拒绝，普通外层 PTC 与外层 PTC 提权路径区分正确。
+关闭 popup 托盘开关后，提权必须以明确的“未返回决定”提示拒绝。
+关闭插件后不再有本插件的审核或 popup，approval 和 sandbox 均保持原生选择。
 完整 macOS UI、真实 LLM 和 OS bash/PTC worker confinement 需要额外实机验收，
 不能用单元测试通过代替这些结论。
 

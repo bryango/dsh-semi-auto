@@ -71,6 +71,8 @@ async function harness() {
     permissionPopupPath: '/test/permission-popup', popupTimeoutMs: 600000,
     processGraceMs: 1000, outputLimitBytes: 65536,
   })
+  expect(ctx.approval.overrideOf(session)).toBe('ask')
+  expect(ctx.sandboxPolicy.resolve({ session }).mode).toBe('workspace-write')
   const input = (call: string) => ({
     name: 'probe', arguments: {}, signal: new AbortController().signal,
     callId: ToolCallId(call), agent,
@@ -93,7 +95,7 @@ function whenAborted(signal: AbortSignal): Promise<void> {
 }
 
 beforeEach(() => {
-  popup.mockReset().mockResolvedValue({ kind: 'allow' })
+  popup.mockReset().mockRejectedValue(new Error('A sandbox-only lifecycle fixture must not open the popup'))
   reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
 })
 
@@ -118,7 +120,7 @@ describe('abandoned scheduler authorization ownership', () => {
       await whenAborted(reviewSignal)
       await nextTurn()
       expect(disposed).toBe(false)
-      expect(h.ctx.approval.overrideOf(h.session)).toBe('never')
+      expect(h.ctx.approval.overrideOf(h.session)).toBe('ask')
       const unrelated = { ...h.agent, id: SessionId('unrelated') } as Agent
       h.settle(event, unrelated)
       await nextTurn()
@@ -133,7 +135,7 @@ describe('abandoned scheduler authorization ownership', () => {
       expect(results).not.toHaveBeenCalled()
       expect(h.body).not.toHaveBeenCalled()
       expect(h.ctx.approval.overrideOf(h.session)).toBe('ask')
-      expect(popup).toHaveBeenCalledTimes(1)
+      expect(popup).not.toHaveBeenCalled()
       expect(reviewer).toHaveBeenCalledTimes(1)
     } finally {
       h.settle(event)
@@ -166,7 +168,7 @@ describe('abandoned scheduler authorization ownership', () => {
       await nextTurn()
       expect(bodySignal.aborted).toBe(true)
       expect(disposed).toBe(false)
-      expect(h.ctx.approval.overrideOf(h.session)).toBe('never')
+      expect(h.ctx.approval.overrideOf(h.session)).toBe('ask')
       expect(h.body).toHaveBeenCalledTimes(1)
     } finally {
       h.settle(event)
@@ -175,7 +177,7 @@ describe('abandoned scheduler authorization ownership', () => {
     }
     expect(disposed).toBe(true)
     expect(h.ctx.approval.overrideOf(h.session)).toBe('ask')
-    expect(popup).toHaveBeenCalledTimes(2)
+    expect(popup).not.toHaveBeenCalled()
     expect(reviewer).toHaveBeenCalledTimes(2)
   })
 })

@@ -8,7 +8,7 @@ import { FsError } from '@deepseek-ai/dsh-fs'
 import SandboxedFileSystem from '@deepseek-ai/dsh-fs-sandbox'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import PermissionPresetService from '@deepseek-ai/dsh-permission-presets'
-import { writableRoots } from '@deepseek-ai/dsh-sandbox'
+import { approveEscalation, validateEscalationArgs, writableRoots } from '@deepseek-ai/dsh-sandbox'
 import SandboxPolicyService, { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
@@ -16,7 +16,7 @@ import SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import { LocalSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-local'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import ApprovalService from '@deepseek-ai/dsh-user-approval'
+import ApprovalService, { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import * as SemiAuto from '../src/index.js'
 import { reviewTool } from '../src/auto-review.js'
 import { runPopup } from '../src/popup-runner.js'
@@ -94,6 +94,7 @@ async function harness(mode: 'read-only' | 'workspace-write' = 'workspace-write'
   })
   await ctx.plugin(SubagentRuntime, {})
   const session = ctx.sessions.create(SessionId('sandbox-fixture'), { meta: { cwd: workspace } })
+  session.append('turn/start', { turn: 1 })
   if (mode === 'read-only') setSandboxMode(session, mode)
   // The real ToolRuntime requires an agent scope, Session and Context, not a running LLM loop.
   const agent = { id: session.id, session, ctx, options: { provider: 'fixture', model: 'fixture' } } as Agent
@@ -101,8 +102,7 @@ async function harness(mode: 'read-only' | 'workspace-write' = 'workspace-write'
   ctx.on('approval/request', async () => { builtInApproval(); return 'allowed-once' })
   const policies: ReturnType<typeof ctx.sandboxPolicy.resolve>[] = []
   const failures: unknown[] = []
-  const body = vi.fn(async (path: string, content: string, signal: AbortSignal) => {
-    const policy = ctx.sandboxPolicy.resolve({ session })
+  const body = vi.fn(async (path: string, content: string, signal: AbortSignal, policy: ReturnType<typeof ctx.sandboxPolicy.resolve>) => {
     policies.push(policy)
     const target = await ctx.fs.resolve(path, { cwd: workspace, signal })
     try {
@@ -121,8 +121,22 @@ async function harness(mode: 'read-only' | 'workspace-write' = 'workspace-write'
       path: { type: 'string', required: true },
       content: { type: 'string', required: true },
       sandbox_permissions: { type: 'string' },
+      justification: { type: 'string' },
     },
-    execute: async (args, exec) => body(args.path, args.content, exec.signal),
+    execute: async (args, exec) => {
+      validateEscalationArgs(args.sandbox_permissions, args.justification)
+      const standing = ctx.sandboxPolicy.resolve({ session })
+      const mode = args.sandbox_permissions === undefined ? standing.mode : await approveEscalation({
+        requestedMode: args.sandbox_permissions,
+        justification: args.justification!,
+        effectiveMode: standing.mode,
+        subject: 'operation',
+      }, {
+        approver: ctx.approval, agent: exec.agent, callId: exec.callId,
+        toolName: 'sandbox_write', signal: exec.signal,
+      })
+      return body(args.path, args.content, exec.signal, { ...standing, mode })
+    },
   }))
   await ctx.plugin(SemiAuto, CONFIG)
 
@@ -131,19 +145,19 @@ async function harness(mode: 'read-only' | 'workspace-write' = 'workspace-write'
   expect(policy.workspaceRoot).toBe(workspace)
   // The backend default stays workspace-write; the session's effective policy wins.
   expect(ctx.fs.sandboxMode).toBe('workspace-write')
-  expect(ctx.approval.overrideOf(session)).toBe('never')
+  expect(ctx.approval.overrideOf(session) ?? ctx.approval.config.policy).toBe('ask')
   for (const granted of writableRoots(policy)) {
     expect(contains(await realpath(granted), outside), `outside fixture must not be granted by ${granted}`).toBe(false)
   }
   let call = 0
   const execute = (path: string, content: string, sandbox_permissions?: string) => ctx.tools.execute({
     name: 'sandbox_write',
-    arguments: { path, content, ...sandbox_permissions === undefined ? {} : { sandbox_permissions } },
+    arguments: { path, content, ...sandbox_permissions === undefined ? {} : { sandbox_permissions, justification: 'Exercise one explicit native escalation' } },
     signal: new AbortController().signal,
     callId: ToolCallId(`sandbox-${++call}`),
     agent,
   })
-  return { workspace, outside, execute, body, failures, policies, builtInApproval }
+  return { ctx, session, workspace, outside, execute, body, failures, policies, builtInApproval }
 }
 
 beforeEach(() => {
@@ -168,9 +182,8 @@ afterEach(async () => {
 })
 
 describe('Semi Auto with real rc3 sandboxed filesystem execution', () => {
-  it.each(['allow', 'allow_direct'] as const)('human %s permits an actual workspace-local write', async (kind) => {
+  it('reviews an actual workspace-local write without opening the popup', async () => {
     const h = await harness()
-    popup.mockResolvedValue({ kind })
     const path = join(h.workspace, 'created.txt')
     const result = await h.execute(path, 'workspace content')
     expect(result.isError).toBe(false)
@@ -178,14 +191,13 @@ describe('Semi Auto with real rc3 sandboxed filesystem execution', () => {
     expect(h.body).toHaveBeenCalledTimes(1)
     expect(h.failures).toEqual([])
     expect(h.policies).toEqual([expect.objectContaining({ mode: 'workspace-write', workspaceRoot: h.workspace })])
-    expect(popup).toHaveBeenCalledTimes(1)
-    expect(reviewer).toHaveBeenCalledTimes(kind === 'allow' ? 1 : 0)
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).toHaveBeenCalledTimes(1)
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
-  it.each(['allow', 'allow_direct'] as const)('human %s cannot write inside a read-only workspace', async (kind) => {
+  it('cannot write inside a read-only workspace after automatic review', async () => {
     const h = await harness('read-only')
-    popup.mockResolvedValue({ kind })
     const existing = join(h.workspace, 'existing.txt')
     const missing = join(h.workspace, 'not-created.txt')
     await writeFile(existing, 'original content')
@@ -196,7 +208,7 @@ describe('Semi Auto with real rc3 sandboxed filesystem execution', () => {
     }
     expect(await readFile(existing, 'utf8')).toBe('original content')
     await expect(stat(missing)).rejects.toMatchObject({ code: 'ENOENT' })
-    // Both authorization routes reach the real backend with read-only unchanged.
+    // Automatic review reaches the real backend with read-only unchanged.
     expect(h.body).toHaveBeenCalledTimes(2)
     expect(h.failures).toHaveLength(2)
     for (const error of h.failures) {
@@ -204,14 +216,13 @@ describe('Semi Auto with real rc3 sandboxed filesystem execution', () => {
       expect(error).toMatchObject({ code: 'FS_SANDBOX_DENIED' })
     }
     expect(h.policies).toEqual(Array.from({ length: 2 }, () => expect.objectContaining({ mode: 'read-only', workspaceRoot: h.workspace })))
-    expect(popup).toHaveBeenCalledTimes(2)
-    expect(reviewer).toHaveBeenCalledTimes(kind === 'allow' ? 2 : 0)
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).toHaveBeenCalledTimes(2)
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
-  it.each(['allow', 'allow_direct'] as const)('human %s cannot bypass the filesystem fence outside the workspace', async (kind) => {
+  it('cannot bypass the filesystem fence after automatic review', async () => {
     const h = await harness()
-    popup.mockResolvedValue({ kind })
     const existing = join(h.outside, 'existing.txt')
     const missing = join(h.outside, 'not-created.txt')
     await writeFile(existing, 'original content')
@@ -231,23 +242,58 @@ describe('Semi Auto with real rc3 sandboxed filesystem execution', () => {
       expect(error).toMatchObject({ code: 'FS_SANDBOX_DENIED' })
     }
     expect(h.policies).toEqual(Array.from({ length: 2 }, () => expect.objectContaining({ mode: 'workspace-write', workspaceRoot: h.workspace })))
-    expect(popup).toHaveBeenCalledTimes(2)
-    expect(reviewer).toHaveBeenCalledTimes(kind === 'allow' ? 2 : 0)
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).toHaveBeenCalledTimes(2)
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
-  it.each(['danger-full-access', 'workspace-write'])('rejects explicit %s escalation before popup, approval or mutation', async (mode) => {
+  it.each(['allow', 'allow_direct'] as const)('human %s grants only one explicit outside-workspace write', async (kind) => {
     const h = await harness()
+    popup.mockResolvedValue({ kind })
     const path = join(h.outside, 'protected.txt')
     await writeFile(path, 'unchanged')
-    const result = await h.execute(path, 'escalated write', mode)
-    expect(result.isError).toBe(true)
-    expect(JSON.stringify(result)).toContain('rejects sandbox escalation')
+    const elevated = await h.execute(path, 'one-time write', 'danger-full-access')
+    expect(elevated.isError, JSON.stringify(elevated)).toBe(false)
+    expect(await readFile(path, 'utf8')).toBe('one-time write')
+    expect(h.policies[0]).toMatchObject({ mode: 'danger-full-access' })
+    expect(popup).toHaveBeenCalledTimes(1)
+    expect(reviewer).toHaveBeenCalledTimes(kind === 'allow' ? 1 : 0)
+    expect(h.ctx.sandboxPolicy.resolve({ session: h.session }).mode).toBe('workspace-write')
+    expect(h.ctx.approval.overrideOf(h.session) ?? h.ctx.approval.config.policy).toBe('ask')
+    expect((await h.execute(path, 'ordinary retry must fail')).isError).toBe(true)
+    expect(await readFile(path, 'utf8')).toBe('one-time write')
+    expect(h.policies[1]).toMatchObject({ mode: 'workspace-write' })
+    expect(popup).toHaveBeenCalledTimes(1)
+    expect(reviewer).toHaveBeenCalledTimes(kind === 'allow' ? 2 : 1)
+    expect(h.builtInApproval).not.toHaveBeenCalled()
+  })
+
+  it('handles read-only to workspace-write as a native one-shot widening', async () => {
+    const h = await harness('read-only')
+    const path = join(h.workspace, 'promoted.txt')
+    expect((await h.execute(path, 'one-time workspace write', 'workspace-write')).isError).toBe(false)
+    expect(await readFile(path, 'utf8')).toBe('one-time workspace write')
+    expect(h.ctx.sandboxPolicy.resolve({ session: h.session }).mode).toBe('read-only')
+    expect(popup).toHaveBeenCalledTimes(1)
+    expect(reviewer).toHaveBeenCalledTimes(1)
+    expect((await h.execute(path, 'ordinary retry')).isError).toBe(true)
+    expect(await readFile(path, 'utf8')).toBe('one-time workspace write')
+    expect(popup).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['human', 'reviewer', 'never'] as const)('rejects elevation at the %s gate before mutation', async (gate) => {
+    const h = await harness()
+    if (gate === 'human') popup.mockResolvedValue({ kind: 'deny', reason: 'No permission' })
+    if (gate === 'reviewer') reviewer.mockResolvedValue({ kind: 'deny', reason: 'Unsafe action' })
+    if (gate === 'never') setApprovalPolicy(h.session, 'never')
+    const path = join(h.outside, 'protected.txt')
+    await writeFile(path, 'unchanged')
+    expect((await h.execute(path, 'must not write', 'danger-full-access')).isError).toBe(true)
     expect(await readFile(path, 'utf8')).toBe('unchanged')
     expect(h.body).not.toHaveBeenCalled()
     expect(h.policies).toEqual([])
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
+    expect(popup).toHaveBeenCalledTimes(gate === 'never' ? 0 : 1)
+    expect(reviewer).toHaveBeenCalledTimes(gate === 'reviewer' ? 1 : 0)
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 })

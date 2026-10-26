@@ -3,6 +3,7 @@ import { Service } from '@deepseek-ai/cordis'
 import SandboxBashExecutor from '@deepseek-ai/dsh-bash-sandbox'
 import SandboxedFileSystem from '@deepseek-ai/dsh-fs-sandbox'
 import PermissionPresetService from '@deepseek-ai/dsh-permission-presets'
+import { approveEscalation } from '@deepseek-ai/dsh-sandbox'
 import LocalSandbox from '@deepseek-ai/dsh-sandbox-local'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
@@ -24,13 +25,17 @@ class FixtureState extends Service {
 }
 
 class FixtureLlm extends Service {
-  constructor(ctx) {
+  constructor(ctx, config) {
     super(ctx, 'llm')
-    this.state = ctx.get('loaderFixture')
+    this.countReview = config.countReview
   }
-  stream() {
-    this.state.reviews++
-    throw new Error('Direct authorization must not call the reviewer')
+  async * stream() {
+    this.countReview()
+    const text = '{"risk":"low","decision":"allow"}'
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
   }
 }
 
@@ -58,13 +63,25 @@ export async function apply(ctx, config) {
   ctx.get('tools').register(defineContentToolFixture({
     name: 'loader_probe',
     description: 'Count actual dispatches through the Loader-mounted tool pipeline',
-    parameters: {},
-    execute: async () => {
+    parameters: {
+      sandbox_permissions: { type: 'string' },
+      justification: { type: 'string' },
+    },
+    execute: async (args, exec) => {
+      if (args.sandbox_permissions !== undefined) await approveEscalation({
+        requestedMode: args.sandbox_permissions,
+        justification: args.justification,
+        effectiveMode: ctx.get('sandboxPolicy').resolve({ session: exec.agent.session }).mode,
+        subject: 'operation',
+      }, {
+        approver: ctx.get('approval'), agent: exec.agent, callId: exec.callId,
+        toolName: 'loader_probe', signal: exec.signal,
+      })
       state.calls++
       return [{ type: 'text', text: 'Loader tool body executed' }]
     },
   }))
-  await ctx.plugin(FixtureLlm)
+  await ctx.plugin(FixtureLlm, { countReview: () => { state.reviews++ } })
   // Publish the final required dependency only after the existing session is ready.
   await ctx.plugin(SubagentRuntime, {})
 }
