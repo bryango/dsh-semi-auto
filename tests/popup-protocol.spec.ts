@@ -82,15 +82,12 @@ describe('popup response protocol', () => {
     expect(decodePopupOutput(output('deny'))).toEqual({ kind: 'deny', reason: expect.any(String) })
   })
 
-  it.each(['', ' ', '\t\r\n'])('denies absent decisions with actionable disabled-popup guidance: %j', text => {
-    expect(decodePopupOutput(text)).toEqual({
-      kind: 'deny',
-      reason: 'Permission popup produced no decision and may be disabled. Check its tray toggle or permission-popup config.json; no action was authorized.',
-    })
+  it('treats exactly empty stdout as no decision rather than approval or denial', () => {
+    expect(decodePopupOutput('')).toEqual({ kind: 'no_decision' })
   })
 
   it.each([
-    'not json', '{}', 'null', '[]', 'true',
+    ' ', '\t\r\n', 'not json', '{}', 'null', '[]', 'true',
     `${output('allow')}\n${output('allow')}`,
     JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', decision: { behavior: 'allow' } } }),
     JSON.stringify({ hookSpecificOutput: { decision: { behavior: 'allow' } } }),

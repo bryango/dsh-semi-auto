@@ -143,7 +143,8 @@ export function apply(ctx: Context, config: Config): void {
         audit(exec, `human-${human.kind}`)
         if (signal.aborted) return 'cancelled'
         if (human.kind === 'deny' || failure(exec) !== undefined) return 'rejected'
-        if (human.kind === 'allow') {
+        // An abstaining/disabled popup defers to Auto; it never grants execution.
+        if (human.kind === 'allow' || human.kind === 'no_decision') {
           // A wider run_code request authorizes the complete program, unlike
           // an ordinary sandboxed outer transport, and must be reviewed here.
           const reviewed = await reviewTool(ctx, exec, signal)

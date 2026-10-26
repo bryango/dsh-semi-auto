@@ -20,6 +20,7 @@
 原生有效提权审批
   → permission-popup --host dsh
       ├─ Auto review / allow → vendored official Auto reviewer → allowed-once
+      ├─ disabled popup / exit 0 + empty stdout → Auto reviewer → allowed-once
       ├─ Authorize / allow_direct → allowed-once
       └─ Deny / invalid output / failure / timeout → reject
 ```
@@ -53,10 +54,10 @@
 
 ### 空响应与 Custom 菜单调查
 
-已复现的无效响应来自 popup 托盘配置 `enabled: false`：
-该状态下 binary 正常退出但 stdout 为空，并非已证明正常 JSON envelope 不兼容。
-插件仍将空或纯空白响应视为拒绝，错误会明确提示检查托盘开关或 popup 配置；
-不能把“没有决定”当成允许。
+popup 托盘配置 `enabled: false` 时，binary 正常退出且 stdout 为空，表示 **no decision**。
+插件此时继续 Auto review；只有 reviewer 允许后才授权本次执行。
+空输出不是人工允许或拒绝，也不会跳过 reviewer。
+仅正常退出、无截断且完整 stdout 为零字节时采用这一语义；纯空白或无效 JSON、异常退出、超时及清理失败仍拒绝。
 
 原生权限 preset 同时匹配 sandbox 和 approval。
 旧实现把 `workspace-write + ask` 改成 `workspace-write + never`，
@@ -143,8 +144,8 @@ dsh plugin --profile desktop remove dsh-semi-auto
 
 DSH 的 patch 整体替换 `config`，覆盖其他配置时仍需填写 `permissionPopupPath`。
 popup 自身的默认队列/窗口 deadline 是 540 秒；其环境变量及托盘设置仍由 popup 项目管理。
-提权前请确认 popup 的托盘开关已开启；关闭开关时的空 stdout 会被明确拒绝，
-并提示检查开关，不会回退为允许或内置审批。
+托盘开关开启时显示人工 popup；关闭时返回 no decision，直接进入 Auto review，
+不会直接允许、直接拒绝或回退为内置审批。
 其输入上限是完整 JSON stdin（包含换行）8 MiB。
 
 ## 安全与范围
@@ -188,7 +189,7 @@ PTC inner-call 校验、真实 filesystem workspace/outside-workspace 写入。
 确认普通 sandbox 调用只做 Auto、不弹窗，sandbox 拒绝不会自动弹窗或重试；
 再提交原生有效提权请求，分别点击 Auto review、Authorize、Deny，确认审核次数和单次工具效果。
 确认 `never` 下的提权不弹窗而直接拒绝，普通外层 PTC 与外层 PTC 提权路径区分正确。
-关闭 popup 托盘开关后，提权必须以明确的“未返回决定”提示拒绝。
+关闭 popup 托盘开关后，提权不弹窗但必须经过 Auto review；确认 reviewer 的允许／拒绝仍然决定本次执行。
 关闭插件后不再有本插件的审核或 popup，approval 和 sandbox 均保持原生选择。
 完整 macOS UI、真实 LLM 和 OS bash/PTC worker confinement 需要额外实机验收，
 不能用单元测试通过代替这些结论。

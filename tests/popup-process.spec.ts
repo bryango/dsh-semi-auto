@@ -70,7 +70,7 @@ process.stdin.on('end', () => {
     const payload = JSON.parse(input);
     assert.deepEqual(payload, expected);
     const behavior = payload.tool_input.behavior;
-    if (!['allow', 'allow_direct', 'deny', 'nonzero', 'malformed', 'sleep'].includes(behavior)) throw new Error('unsupported fixture behavior');
+    if (!['allow', 'allow_direct', 'deny', 'no_decision', 'empty_nonzero', 'nonzero', 'malformed', 'sleep'].includes(behavior)) throw new Error('unsupported fixture behavior');
     if (behavior === 'sleep') {
       process.on('SIGTERM', () => {
         fs.writeFileSync(${JSON.stringify(stoppedPath)}, 'terminated');
@@ -84,6 +84,10 @@ process.stdin.on('end', () => {
     fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ pid: process.pid }));
     if (behavior === 'malformed') {
       process.stdout.write('not authorization JSON\\n');
+      return;
+    }
+    if (behavior === 'no_decision' || behavior === 'empty_nonzero') {
+      process.exitCode = behavior === 'empty_nonzero' ? 7 : 0;
       return;
     }
     const decision = { behavior: behavior === 'nonzero' ? 'allow' : behavior };
@@ -156,6 +160,22 @@ describe('popup runner with managed local processes', () => {
     const f = await fixture(behavior, toolName)
     const result = await runPopup(f.runtime, f.request, f.config, new AbortController().signal)
     expect(result).toEqual({ kind: behavior })
+    await f.assertDrained(await f.ready())
+  })
+
+  it('preserves a disabled helper no-decision result only after successful exit and drain', async () => {
+    const f = await fixture('no_decision')
+    expect(await runPopup(f.runtime, f.request, f.config, new AbortController().signal))
+      .toEqual({ kind: 'no_decision' })
+    await expect(f.handles[0]!.done).resolves.toEqual({ exitCode: 0, signal: null })
+    await f.assertDrained(await f.ready())
+  })
+
+  it('does not treat a real empty-output process failure as no decision', async () => {
+    const f = await fixture('empty_nonzero')
+    expect(await runPopup(f.runtime, f.request, f.config, new AbortController().signal))
+      .toEqual({ kind: 'deny', reason: 'Permission popup exited unsuccessfully.' })
+    await expect(f.handles[0]!.done).resolves.toEqual({ exitCode: 7, signal: null })
     await f.assertDrained(await f.ready())
   })
 

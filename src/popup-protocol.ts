@@ -7,6 +7,7 @@ export const POPUP_INPUT_LIMIT_BYTES = 8 * 1024 * 1024
 export type HumanDecision =
   | { readonly kind: 'allow' }
   | { readonly kind: 'allow_direct' }
+  | { readonly kind: 'no_decision' }
   | { readonly kind: 'deny'; readonly reason: string }
 
 /** Pending-call metadata; no conversation history or model reasoning is included. */
@@ -131,14 +132,9 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
   return Object.keys(value).every(key => keys.includes(key))
 }
 
-/** Decode only explicit DSH decisions; unexpected fields and repeated keys fail closed. */
+/** Empty output abstains; malformed output, unexpected fields and repeated keys fail closed. */
 export function decodePopupOutput(stdout: string): HumanDecision {
-  if (stdout.trim() === '') {
-    return {
-      kind: 'deny',
-      reason: 'Permission popup produced no decision and may be disabled. Check its tray toggle or permission-popup config.json; no action was authorized.',
-    }
-  }
+  if (stdout === '') return { kind: 'no_decision' }
   const invalid: HumanDecision = { kind: 'deny', reason: 'Permission popup returned an invalid authorization response.' }
   let value: unknown
   try {

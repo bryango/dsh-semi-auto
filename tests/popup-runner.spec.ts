@@ -61,18 +61,18 @@ describe('trusted native popup runner', () => {
     expect(await runPopup(f.runtime, request, config, new AbortController().signal)).toEqual({ kind: 'allow_direct' })
   })
 
-  it.each(['', ' \t\r\n'])('preserves actionable no-decision denial after a successful empty helper exit: %j', async output => {
-    const f = fixture({ output })
-    expect(await runPopup(f.runtime, request, config, new AbortController().signal)).toEqual({
-      kind: 'deny',
-      reason: 'Permission popup produced no decision and may be disabled. Check its tray toggle or permission-popup config.json; no action was authorized.',
-    })
+  it('preserves no decision only after a successful empty helper exit and cleanup', async () => {
+    const f = fixture({ output: '' })
+    expect(await runPopup(f.runtime, request, config, new AbortController().signal)).toEqual({ kind: 'no_decision' })
     expect(f.terminate).toHaveBeenCalledOnce()
     expect(f.waitForExit).toHaveBeenCalledOnce()
   })
 
   it.each([
-    { output: '{}' }, { output: 'garbage' }, { lossy: true }, { noStdout: true },
+    { output: ' \t\r\n' }, { output: '{}' }, { output: 'garbage' }, { lossy: true }, { noStdout: true },
+    { output: '', outcome: { exitCode: 1, signal: null } },
+    { output: '', outcome: { exitCode: null, signal: 'SIGTERM' as const } },
+    { output: '', lossy: true },
     { outcome: { exitCode: 1, signal: null } }, { outcome: { exitCode: null, signal: 'SIGTERM' as const } },
     { outcome: { exitCode: 0, signal: 'SIGTERM' as const } },
     { output: `${allow}${' '.repeat(config.outputLimitBytes)}` },
@@ -135,6 +135,19 @@ describe('trusted native popup runner', () => {
       expect((await runPopup(f.runtime, request, config, new AbortController().signal)).kind).toBe('deny')
     },
   )
+
+  it.each([async () => false, async (): Promise<boolean> => { throw new Error('cannot observe process range') }])(
+    'does not defer to Auto when an empty-response process cannot be drained', async wait => {
+      const f = fixture({ output: '', wait })
+      expect((await runPopup(f.runtime, request, config, new AbortController().signal)).kind).toBe('deny')
+    },
+  )
+
+  it('does not defer to Auto when cancellation arrives during empty-response cleanup', async () => {
+    const controller = new AbortController()
+    const f = fixture({ output: '', wait: async () => { controller.abort(); return true } })
+    expect(await runPopup(f.runtime, request, config, controller.signal)).toEqual({ kind: 'deny', reason: expect.stringMatching(/cancelled/) })
+  })
 
   it('checks cancellation again after cleanup, even after a valid allow', async () => {
     const controller = new AbortController()
