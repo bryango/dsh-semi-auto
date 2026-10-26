@@ -43,13 +43,16 @@ describe('official reviewer snapshot and deterministic adaptation', () => {
     expect(generated).toContain('export async function reviewTool(')
   })
 
-  it('retains the upstream snapshot, classification, parser, and denial code unchanged', async () => {
+  it('retains upstream classification and denial code except explicit thinking options', async () => {
     const original = (await snapshot()).toString('utf8')
     const generated = await expectedReviewer()
     const classificationStart = '/** Return JSON text for one immutable logged value. */'
     const approvalStart = '/**\n * Ask the user to decide one call the reviewer denied.'
     const retained = original.slice(original.indexOf(classificationStart), original.indexOf(approvalStart))
-    expect(generated).toContain(retained)
+    expect(generated).toContain(retained.replace(
+      '    temperature: 0,\n    signal,',
+      "    temperature: 0,\n    reasoningEffort: ReasoningEffortId('high'),\n    signal,",
+    ))
     expect(generated).toContain(original.slice(
       original.indexOf('/** Materialize a reviewer failure as its own error rather than a denial. */'),
       original.indexOf('/** Install the Auto preset and its prepended per-call review gate. */'),

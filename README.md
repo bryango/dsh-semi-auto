@@ -31,7 +31,8 @@
   `read-only → workspace-write` 同样是需要原生审批的扩大权限，虽然并非完全无 sandbox。
 - `Authorize` 只跳过这次提权的 Auto reviewer，不跳过其他拒绝策略。
   它不撤销此前已经发生的审核拒绝。
-- `Auto review` 使用当前会话最新持久化 request header 的 provider/model。
+- `Auto review` 使用当前会话最新持久化 request header 的 provider/model，明确请求 `reasoningEffort: high`。
+  thinking 由 provider 按该档位启用；不支持时审核失败即拒绝，不静默降级。
   每次审核增加一次 LLM 请求，不提供缓存或自动重试。
 - 人工拒绝、Auto 拒绝和 reviewer 故障均为最终拒绝，不打开内置二次审批。
   缺失或无效提权参数仍先按普通调用做 Auto，再由原生工具验证；重复当前 mode 不需要提权弹窗。

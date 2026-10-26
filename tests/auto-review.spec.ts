@@ -5,8 +5,10 @@ import LlmRuntime, {
   createMessage,
   createUserMessage,
   LlmAdapter,
+  ReasoningEffortId,
   ToolCallId,
   type GenerateOptions,
+  type LlmResolvedModelInfo,
   type MessageSource,
   type StreamChunk,
   type ToolSchema,
@@ -50,6 +52,15 @@ class RecordingAdapter extends LlmAdapter {
   readonly requests: GenerateOptions[] = []
 
   constructor(private readonly response: Response) { super() }
+
+  override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return {
+      provider,
+      id: model,
+      name: model,
+      reasoning: { efforts: [{ id: ReasoningEffortId('high'), name: 'High' }] },
+    }
+  }
 
   async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     this.requests.push(options)
@@ -194,6 +205,21 @@ describe('adapted official Auto reviewer', () => {
     ])
     expect(JSON.stringify(input)).not.toContain('private assistant reasoning')
     expect(f.ask).not.toHaveBeenCalled()
+  })
+
+  it('requests thinking with high reasoning effort on the current logged route', async () => {
+    const f = await fixture()
+    header(f.session)
+    loggedCall(f.session)
+
+    expect((await f.execute()).isError).toBe(false)
+    expect(f.adapter.requests).toHaveLength(1)
+    expect(f.adapter.requests[0]).toMatchObject({
+      provider: 'review-provider',
+      model: 'logged-model',
+      reasoningEffort: 'high',
+      temperature: 0,
+    })
   })
 
   it('returns final structured denial even when built-in approval policy is ask', async () => {

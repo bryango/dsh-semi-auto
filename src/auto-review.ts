@@ -12,6 +12,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-instructions'
 import {
   BlockAssembler,
+  ReasoningEffortId,
   type ContentBlock,
   type GenerateOptions,
   type MessageSource,
@@ -621,6 +622,7 @@ async function classifyRisk(
       content: [{ type: 'text', text: reviewUserText(snapshot) }],
     }],
     temperature: 0,
+    reasoningEffort: ReasoningEffortId('high'),
     signal,
   })
   return readDecision(ctx.llm.stream(options))
