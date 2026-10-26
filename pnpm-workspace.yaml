@@ -1,0 +1,3 @@
+# Portable development tooling for the signed desktop Node runtime.
+overrides:
+  rollup: npm:@rollup/wasm-node@4.65.0

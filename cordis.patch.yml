@@ -1,0 +1,7 @@
+# Configure the binary path in the profile before enabling this entry.
+- insert:
+    - id: semi-auto
+      name: dsh-semi-auto
+      disabled: true
+      config:
+        permissionPopupPath: /absolute/path/to/permission-popup
