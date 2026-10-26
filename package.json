@@ -1,6 +1,6 @@
 {
   "name": "dsh-semi-auto",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Native human approval and official-policy Auto review within the DSH workspace sandbox",
   "type": "module",
   "license": "GPL-3.0-only",
@@ -11,10 +11,22 @@
   "exports": {
     ".": { "types": "./lib/index.d.ts", "default": "./lib/index.js" },
     "./package.json": "./package.json",
-    "./cordis.patch.yml": "./cordis.patch.yml"
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
-  "files": ["lib", "src", "tsconfig.json", "tsconfig.build.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "cordis.patch.yml", "README.md", "UPDATING.md", "THIRD_PARTY_NOTICES.md", "LICENSE", "vendor", "scripts"],
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "files": ["lib", "src", "client.js", "locale", "icon.svg", "tsconfig.json", "tsconfig.build.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "cordis.patch.yml", "README.md", "UPDATING.md", "THIRD_PARTY_NOTICES.md", "LICENSE", "vendor", "scripts"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",

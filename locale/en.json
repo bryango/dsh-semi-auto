@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Semi Auto",
+    "description": "Auto-reviews sandboxed tool calls and opens the human permission popup only for one-shot widening requests. The composer toggle switches it anytime."
+  }
+}

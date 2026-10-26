@@ -53,6 +53,20 @@
 - 宿主日志只记录 session/call/tool/result，不额外记录参数、reviewer reasoning 或 prompt。
   工具调用自身仍按 DSH 原有机制持久化。
 
+### 输入框旁的开关
+
+输入框下方工具行内、原生权限选择器右侧有一个 Semi Auto 开关（客户端插件，`conversation.input.left`）。
+点击即切换模式；状态以 3 秒轮询同步，多窗口一致。
+
+- 关闭时插件完全让位：不做 Auto review、不弹 popup、不注册 guard 拒绝，
+  原生审批 answerer 链原样接管（`approval/request` 直接 `next()`）；
+  正在进行的审核与弹窗自然完成，不中断。
+- 开启后新调用立即恢复原有行为。
+- 模式持久化在 `$DSH_HOME`（默认 `~/.dsh`）下的
+  `plugins/semi-auto/mode.json`；文件缺失或损坏时默认开启。
+- 开关通过共享 `/api` 通道的 `semi-auto.get`／`semi-auto.set` 端点读写；
+  `set` 仅接受布尔 `enabled`。headless 组合没有 connection 服务，不挂路由。
+
 ### 空响应与 Custom 菜单调查
 
 popup 托盘配置 `enabled: false` 时，binary 正常退出且 stdout 为空，表示 **no decision**。

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ToolCallId, type ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -44,6 +47,28 @@ class FixtureDirectory extends Service {
     return agent.session.header.cwd ?? '/workspace'
   }
 }
+/** Structural stand-in for the web connection service collecting the plugin's /api routes. */
+class FixtureConnection extends Service {
+  readonly routes = new Map<string, (request: Request) => Promise<Response>>()
+  constructor(ctx: Context) { super(ctx, 'connection') }
+  readonly fetch = {
+    register: (route: { path: string; fetch: (request: Request) => Promise<Response> }) => {
+      this.routes.set(route.path, route.fetch)
+      return async (): Promise<void> => { this.routes.delete(route.path) }
+    },
+  }
+  async call(path: string, payload: unknown): Promise<unknown> {
+    const handler = this.routes.get(path)
+    if (handler === undefined) throw new Error(`no /api route ${path}`)
+    const response = await handler(new Request(`http://host${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: 'fixture', method: path.slice('/api/'.length), payload }),
+    }))
+    const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+    if (!body.result.ok) throw new Error(body.result.error?.message ?? 'fixture rpc failed')
+    return body.result.value
+  }
+}
 interface PluginHandle { dispose(): Promise<void> }
 interface Args { sandbox_permissions?: string; justification?: string }
 const WIDER = { sandbox_permissions: 'danger-full-access', justification: 'Perform the explicitly requested operation.' }
@@ -60,6 +85,8 @@ async function harness(options: { enable?: boolean; external?: boolean; remoteSu
   if (options.remoteSubprocess) await ctx.plugin(FixtureRemoteSubprocess)
   else await ctx.plugin(LocalSubprocessRuntime)
   await ctx.plugin(FixtureDirectory)
+  await ctx.plugin(FixtureConnection)
+  const connection = ctx.get('connection') as FixtureConnection
   await ctx.plugin(SandboxPolicyService, { mode: options.mode ?? 'workspace-write', workspaceRoot: '/workspace' })
   await ctx.plugin(ApprovalService, { policy: 'ask' })
   await ctx.plugin(PermissionPresetService, {
@@ -104,7 +131,11 @@ async function harness(options: { enable?: boolean; external?: boolean; remoteSu
     name: 'probe', arguments: {}, signal: new AbortController().signal,
     callId: ToolCallId(`call-${++call}`), agent, ...changes,
   })
-  return { ctx, session, agent, body, effect, builtIn, plugin, enable, execute }
+  const setMode = async (enabled: boolean): Promise<void> => {
+    await connection.call('/api/semi-auto.set', { enabled })
+  }
+  const rpcCall = (path: string, payload: unknown): Promise<unknown> => connection.call(path, payload)
+  return { ctx, session, agent, body, effect, builtIn, plugin, enable, execute, setMode, rpcCall }
 }
 function externalProvider(name = 'external'): SubagentProvider {
   return { name, capabilities: NO_START_CAPABILITIES, inheritsParentContext: false,
@@ -124,8 +155,18 @@ function expectPolicy(h: Awaited<ReturnType<typeof harness>>, mode: string, poli
 function finishPrepared(h: Awaited<ReturnType<typeof harness>>, exec: ToolRunContext) {
   h.ctx.tools[TOOL_RUNTIME_SCHEDULER].finish(exec, { content: [], isError: true, error: { message: 'fixture cleanup' } })
 }
-beforeEach(() => { popup.mockReset().mockResolvedValue({ kind: 'allow' }); reviewer.mockReset().mockResolvedValue({ kind: 'allow' }) })
-afterEach(async () => { while (contexts.length) await contexts.pop()!.fiber.dispose(); vi.restoreAllMocks() })
+const modeHomes: string[] = []
+beforeEach(async () => {
+  popup.mockReset().mockResolvedValue({ kind: 'allow' }); reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
+  // Keep the mode state off the developer's real ~/.dsh for every test here.
+  modeHomes.push(await mkdtemp(join(tmpdir(), 'semi-auto-plugin-')))
+  process.env.DSH_HOME = modeHomes[modeHomes.length - 1]
+})
+afterEach(async () => {
+  delete process.env.DSH_HOME
+  while (modeHomes.length) await rm(modeHomes.pop()!, { recursive: true, force: true })
+  while (contexts.length) await contexts.pop()!.fiber.dispose(); vi.restoreAllMocks()
+})
 
 describe('Auto within the standing sandbox and popup only for native widening approval', () => {
   it.each(['read-only', 'workspace-write'] as const)('preserves native %s and ask through enable, new session and disable', async (mode) => {
@@ -649,5 +690,59 @@ describe('Auto within the standing sandbox and popup only for native widening ap
     expect(h.ctx.subagents.getProvider('late')).toBeUndefined()
     await h.plugin!.dispose()
     expect(() => h.ctx.subagents.registerProvider(externalProvider('after-disable'))).not.toThrow()
+  })
+})
+
+describe('Composer mode toggle', () => {
+  it('passes every call through the native approval without popup or review while off', async () => {
+    const h = await harness()
+    await h.setMode(false)
+    popup.mockImplementation(async () => { throw new Error('popup must not run while off') })
+    reviewer.mockImplementation(async () => { throw new Error('reviewer must not run while off') })
+    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect(h.effect).toHaveBeenCalledWith('danger-full-access')
+    expect(h.builtIn).toHaveBeenCalledOnce()
+    expectPolicy(h, 'workspace-write')
+    await h.execute()
+    expect(h.effect).toHaveBeenLastCalledWith('workspace-write')
+  })
+
+  it('flipping the mode back on restores popup and review for new calls', async () => {
+    const h = await harness()
+    await h.setMode(false)
+    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect(h.builtIn).toHaveBeenCalledOnce()
+    await h.setMode(true)
+    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect(popup).toHaveBeenCalledOnce()
+    expect(reviewer).toHaveBeenCalledOnce()
+    expect(h.builtIn).toHaveBeenCalledOnce()
+  })
+
+  it('reports the current mode through the get endpoint', async () => {
+    const h = await harness()
+    await h.setMode(false)
+    expect(await h.rpcCall('/api/semi-auto.get', {})).toEqual({ enabled: false })
+    await h.setMode(true)
+    expect(await h.rpcCall('/api/semi-auto.get', {})).toEqual({ enabled: true })
+  })
+
+  it('rejects a non-boolean set payload and keeps the current mode', async () => {
+    const h = await harness()
+    await expect(h.rpcCall('/api/semi-auto.set', { enabled: 'yes' }))
+      .rejects.toThrow('payload.enabled must be a boolean')
+    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect(popup).toHaveBeenCalledOnce()
+  })
+
+  it('survives a plugin restart with the persisted off mode', async () => {
+    const h = await harness()
+    await h.setMode(false)
+    await h.plugin!.dispose()
+    await h.enable()
+    popup.mockImplementation(async () => { throw new Error('popup must not run while off') })
+    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect(h.builtIn).toHaveBeenCalledOnce()
+    expect(h.effect).toHaveBeenCalledWith('danger-full-access')
   })
 })

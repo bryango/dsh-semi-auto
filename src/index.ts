@@ -13,7 +13,9 @@ import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-working-directory'
 import { isAutoReviewCandidate, reviewTool } from './auto-review.js'
+import { readModeFileSync, writeModeFile } from './mode.js'
 import { runPopup } from './popup-runner.js'
+import { registerModeRpc, type ModeRpc } from './rpc.js'
 
 export const name = 'semi-auto'
 export const inject = ['approval', 'llm', 'permissionPresets', 'sandboxPolicy', 'sessions', 'subagents', 'subprocess', 'tools', 'workingDirectory']
@@ -64,6 +66,16 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   let accepting = true
+  let enabled = readModeFileSync()
+  const rpc: ModeRpc = {
+    getEnabled: () => enabled,
+    // The flip applies immediately; the write settles before the RPC response,
+    // so a restart after a successful toggle reads the flipped mode.
+    setEnabled: value => {
+      enabled = value
+      return writeModeFile(value)
+    },
+  }
   const lifecycle = new AbortController()
   const active = new Set<Promise<void>>()
   const operations = new Map<ToolExecution, Operation>()
@@ -98,7 +110,10 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.effect(function* () {
     yield ctx.on('subagent/provider-added', assertLocalProvider, { prepend: true })
-    yield tools.guard(exec => failure(exec) ?? (operations.get(exec)?.authorized ? undefined : 'Semi Auto review did not complete for this call.'))
+    yield tools.guard(exec => {
+      if (!enabled) return undefined
+      return failure(exec) ?? (operations.get(exec)?.authorized ? undefined : 'Semi Auto review did not complete for this call.')
+    })
     yield ctx.on('tools/result', exec => { release(exec) })
     const releaseOrphans = (agent: ToolExecution['agent']): void => {
       for (const [exec, operation] of operations) {
@@ -115,7 +130,9 @@ export function apply(ctx: Context, config: Config): void {
         if (exec.agent?.session === session) operation.controller.abort(new Error('Semi Auto permissions changed'))
       }
     })
-    yield ctx.on('approval/request', async (request): Promise<ApprovalOutcome> => {
+    yield ctx.on('approval/request', async (request, next): Promise<ApprovalOutcome> => {
+      // Off mode restores the native approval chain untouched.
+      if (!enabled) return next()
       // Native ApprovalService owns the ask/decision audit and rejects never
       // before answerer dispatch. Do not call next(): there is one human UI.
       const matches = [...operations].filter(([exec, operation]) => exec.agent === request.agent
@@ -163,6 +180,8 @@ export function apply(ctx: Context, config: Config): void {
       }
     }, { prepend: true })
     yield ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+      // Off mode is a pure passthrough: no operation tracking, no review.
+      if (!enabled) return next()
       const reason = failure(exec)
       if (reason !== undefined) return { kind: 'deny', reason }
       const wider = isWidening(exec)
@@ -205,6 +224,7 @@ export function apply(ctx: Context, config: Config): void {
       }
     }, { prepend: true })
     yield ctx.on('tools/execute', async (exec, next) => {
+      if (!enabled) return next()
       const operation = operations.get(exec)
       const reason = failure(exec)
       if (reason !== undefined || operation?.authorized !== true) throw new Error(reason ?? 'Semi Auto review did not complete for this call.')
@@ -228,4 +248,8 @@ export function apply(ctx: Context, config: Config): void {
       await Promise.allSettled([...active, ...[...operations.values()].map(operation => operation.done)])
     }
   }, 'semi-auto lifecycle')
+
+  // The composer toggle rides the shared /api channel; headless compositions
+  // without a connection service simply get no routes.
+  registerModeRpc(ctx, rpc)
 }
