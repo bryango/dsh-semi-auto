@@ -61,8 +61,18 @@ describe('trusted native popup runner', () => {
     expect(await runPopup(f.runtime, request, config, new AbortController().signal)).toEqual({ kind: 'allow_direct' })
   })
 
+  it.each(['', ' \t\r\n'])('preserves actionable no-decision denial after a successful empty helper exit: %j', async output => {
+    const f = fixture({ output })
+    expect(await runPopup(f.runtime, request, config, new AbortController().signal)).toEqual({
+      kind: 'deny',
+      reason: 'Permission popup produced no decision and may be disabled. Check its tray toggle or permission-popup config.json; no action was authorized.',
+    })
+    expect(f.terminate).toHaveBeenCalledOnce()
+    expect(f.waitForExit).toHaveBeenCalledOnce()
+  })
+
   it.each([
-    { output: '' }, { output: '{}' }, { output: 'garbage' }, { lossy: true }, { noStdout: true },
+    { output: '{}' }, { output: 'garbage' }, { lossy: true }, { noStdout: true },
     { outcome: { exitCode: 1, signal: null } }, { outcome: { exitCode: null, signal: 'SIGTERM' as const } },
     { outcome: { exitCode: 0, signal: 'SIGTERM' as const } },
     { output: `${allow}${' '.repeat(config.outputLimitBytes)}` },

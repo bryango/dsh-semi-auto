@@ -133,6 +133,12 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
 
 /** Decode only explicit DSH decisions; unexpected fields and repeated keys fail closed. */
 export function decodePopupOutput(stdout: string): HumanDecision {
+  if (stdout.trim() === '') {
+    return {
+      kind: 'deny',
+      reason: 'Permission popup produced no decision and may be disabled. Check its tray toggle or permission-popup config.json; no action was authorized.',
+    }
+  }
   const invalid: HumanDecision = { kind: 'deny', reason: 'Permission popup returned an invalid authorization response.' }
   let value: unknown
   try {

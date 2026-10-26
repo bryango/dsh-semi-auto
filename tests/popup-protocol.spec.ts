@@ -82,8 +82,15 @@ describe('popup response protocol', () => {
     expect(decodePopupOutput(output('deny'))).toEqual({ kind: 'deny', reason: expect.any(String) })
   })
 
+  it.each(['', ' ', '\t\r\n'])('denies absent decisions with actionable disabled-popup guidance: %j', text => {
+    expect(decodePopupOutput(text)).toEqual({
+      kind: 'deny',
+      reason: 'Permission popup produced no decision and may be disabled. Check its tray toggle or permission-popup config.json; no action was authorized.',
+    })
+  })
+
   it.each([
-    '', ' ', 'not json', '{}', 'null', '[]', 'true',
+    'not json', '{}', 'null', '[]', 'true',
     `${output('allow')}\n${output('allow')}`,
     JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', decision: { behavior: 'allow' } } }),
     JSON.stringify({ hookSpecificOutput: { decision: { behavior: 'allow' } } }),
@@ -93,7 +100,7 @@ describe('popup response protocol', () => {
     output('continue'), output('ALLOW'), output('allow', { message: false }),
     output('allow', { updatedInput: { command: 'different' } }), output('allow', { permissionDecision: 'deny' }),
   ])('fails closed for malformed or unsupported responses: %s', text => {
-    expect(decodePopupOutput(text).kind).toBe('deny')
+    expect(decodePopupOutput(text)).toEqual({ kind: 'deny', reason: 'Permission popup returned an invalid authorization response.' })
   })
 
   it.each([
