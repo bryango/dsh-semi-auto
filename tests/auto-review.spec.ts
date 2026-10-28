@@ -58,7 +58,7 @@ class RecordingAdapter extends LlmAdapter {
       provider,
       id: model,
       name: model,
-      reasoning: { efforts: [{ id: ReasoningEffortId('high'), name: 'High' }] },
+      reasoning: { efforts: [{ id: ReasoningEffortId('low'), name: 'Low' }] },
     }
   }
 
@@ -190,7 +190,8 @@ describe('adapted official Auto reviewer', () => {
     expect(f.decisions).toEqual([{ kind: 'allow' }])
     expect(f.adapter.requests).toHaveLength(1)
     const request = f.adapter.requests[0]!
-    expect(request).toMatchObject({ provider: 'review-provider', model: 'logged-model', temperature: 0 })
+    expect(request).toMatchObject({ provider: 'review-provider', model: 'logged-model' })
+    expect(request.temperature).toBeUndefined()
     expect(request.tools).toBeUndefined()
     expect(request.system).toContain('REVIEW_POLICY')
     const input = sections(request)
@@ -207,7 +208,7 @@ describe('adapted official Auto reviewer', () => {
     expect(f.ask).not.toHaveBeenCalled()
   })
 
-  it('requests thinking with high reasoning effort on the current logged route', async () => {
+  it('requests low reasoning effort and no fixed temperature', async () => {
     const f = await fixture()
     header(f.session)
     loggedCall(f.session)
@@ -217,9 +218,9 @@ describe('adapted official Auto reviewer', () => {
     expect(f.adapter.requests[0]).toMatchObject({
       provider: 'review-provider',
       model: 'logged-model',
-      reasoningEffort: 'high',
-      temperature: 0,
+      reasoningEffort: 'low',
     })
+    expect(f.adapter.requests[0]!.temperature).toBeUndefined()
   })
 
   it('returns final structured denial even when built-in approval policy is ask', async () => {

@@ -114,7 +114,7 @@ export function generateReviewer(sourceBytes, metadata) {
   result = replaceOnce(result, "import type {} from '@deepseek-ai/dsh-user-approval'\n", '', 'approval type import')
   result = replaceOnce(result, pluginExports, '', 'plugin exports')
   result = replaceOnce(result, '  BlockAssembler,\n', '  BlockAssembler,\n  ReasoningEffortId,\n', 'reasoning effort import')
-  result = replaceOnce(result, '    temperature: 0,\n    signal,\n', "    temperature: 0,\n    reasoningEffort: ReasoningEffortId('high'),\n    signal,\n", 'reviewer reasoning effort')
+  result = replaceOnce(result, '    temperature: 0,\n    signal,\n', "    reasoningEffort: ReasoningEffortId('low'),\n    signal,\n", 'reviewer request options')
   result = replaceOnce(result, askUser, '', 'built-in approval helper')
   return result + adapter
 }

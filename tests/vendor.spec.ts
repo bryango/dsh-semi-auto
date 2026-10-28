@@ -51,7 +51,7 @@ describe('official reviewer snapshot and deterministic adaptation', () => {
     const retained = original.slice(original.indexOf(classificationStart), original.indexOf(approvalStart))
     expect(generated).toContain(retained.replace(
       '    temperature: 0,\n    signal,',
-      "    temperature: 0,\n    reasoningEffort: ReasoningEffortId('high'),\n    signal,",
+      "    reasoningEffort: ReasoningEffortId('low'),\n    signal,",
     ))
     expect(generated).toContain(original.slice(
       original.indexOf('/** Materialize a reviewer failure as its own error rather than a denial. */'),
