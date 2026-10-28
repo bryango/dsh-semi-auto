@@ -157,7 +157,7 @@ function finishPrepared(h: Awaited<ReturnType<typeof harness>>, exec: ToolRunCon
 }
 const modeHomes: string[] = []
 beforeEach(async () => {
-  popup.mockReset().mockResolvedValue({ kind: 'allow' }); reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
+  popup.mockReset().mockResolvedValue({ kind: 'no_decision' }); reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
   // Keep the mode state off the developer's real ~/.dsh for every test here.
   modeHomes.push(await mkdtemp(join(tmpdir(), 'semi-auto-plugin-')))
   process.env.DSH_HOME = modeHomes[modeHomes.length - 1]
@@ -300,10 +300,10 @@ describe('Auto within the standing sandbox and popup only for native widening ap
     expect(h.builtIn).not.toHaveBeenCalled()
     expect(popup).not.toHaveBeenCalled()
   })
-  it('defers wider-call review until native popup allows, then grants only the requested call', async () => {
+  it('defers wider-call review until native popup defers, then grants only the requested call', async () => {
     const h = await harness()
     const order: string[] = []
-    popup.mockImplementation(async () => { order.push('human'); return { kind: 'allow' } })
+    popup.mockImplementation(async () => { order.push('human'); return { kind: 'no_decision' } })
     reviewer.mockImplementation(async () => { order.push('reviewer'); return { kind: 'allow' } })
     h.effect.mockImplementation(() => { order.push('effect') })
     expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
@@ -355,7 +355,7 @@ describe('Auto within the standing sandbox and popup only for native widening ap
   })
   it('Authorize skips Auto for that wider call only, not future sandbox calls', async () => {
     const h = await harness()
-    popup.mockResolvedValue({ kind: 'allow_direct' })
+    popup.mockResolvedValue({ kind: 'allow' })
     expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
     expect(reviewer).not.toHaveBeenCalled()
     expect(h.effect).toHaveBeenCalledWith('danger-full-access')
@@ -392,7 +392,7 @@ describe('Auto within the standing sandbox and popup only for native widening ap
   })
   it('does not cache grants across calls, including reused call-id after final result', async () => {
     const h = await harness()
-    popup.mockResolvedValueOnce({ kind: 'allow_direct' }).mockResolvedValueOnce({ kind: 'deny', reason: 'deny second' })
+    popup.mockResolvedValueOnce({ kind: 'allow' }).mockResolvedValueOnce({ kind: 'deny', reason: 'deny second' })
     const same = { arguments: WIDER, callId: ToolCallId('reused-id') }
     expect((await h.execute(same)).isError).toBe(false)
     expect((await h.execute(same)).isError).toBe(true)
@@ -471,7 +471,7 @@ describe('Auto within the standing sandbox and popup only for native widening ap
   })
   it('does not reuse a grant for a second approval from the same dispatch', async () => {
     const h = await harness()
-    popup.mockResolvedValue({ kind: 'allow_direct' })
+    popup.mockResolvedValue({ kind: 'allow' })
     h.body.mockImplementation(async (_args, exec) => {
       const request = { agent: h.agent, toolName: exec.name, callId: exec.callId, signal: exec.signal }
       expect(await h.ctx.approval.request(request)).toBe('allowed-once')
@@ -486,7 +486,7 @@ describe('Auto within the standing sandbox and popup only for native widening ap
     const h = await harness()
     const entered = Promise.withResolvers<void>()
     const release = Promise.withResolvers<void>()
-    popup.mockImplementation(async () => { entered.resolve(); await release.promise; return { kind: 'allow_direct' } })
+    popup.mockImplementation(async () => { entered.resolve(); await release.promise; return { kind: 'allow' } })
     h.body.mockImplementation(async (_args, exec) => {
       const request = { agent: h.agent, toolName: exec.name, callId: exec.callId, signal: exec.signal }
       const first = h.ctx.approval.request(request)
@@ -551,7 +551,7 @@ describe('Auto within the standing sandbox and popup only for native widening ap
     const h = await harness()
     const entered = Promise.withResolvers<AbortSignal>()
     const release = Promise.withResolvers<void>()
-    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
+    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'no_decision' } })
     else reviewer.mockImplementation(async (_ctx, _exec, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
     const running = h.execute(stage === 'human' ? { arguments: WIDER } : {})
     const signal = await entered.promise
@@ -567,7 +567,7 @@ describe('Auto within the standing sandbox and popup only for native widening ap
     const h = await harness()
     const entered = Promise.withResolvers<AbortSignal>()
     const release = Promise.withResolvers<void>()
-    popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow_direct' } })
+    popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
     const running = h.execute({ arguments: WIDER })
     const signal = await entered.promise
     setApprovalPolicy(h.session, 'never')
@@ -596,7 +596,7 @@ describe('Auto within the standing sandbox and popup only for native widening ap
     const h = await harness()
     const entered = Promise.withResolvers<AbortSignal>()
     const release = Promise.withResolvers<void>()
-    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow_direct' } })
+    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'no_decision' } })
     else reviewer.mockImplementation(async (_ctx, _exec, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
     const running = h.execute(stage === 'human' ? { arguments: WIDER } : {})
     const signal = await entered.promise
@@ -618,7 +618,7 @@ describe('Auto within the standing sandbox and popup only for native widening ap
     const h = await harness()
     const entered = Promise.withResolvers<void>()
     const release = Promise.withResolvers<void>()
-    popup.mockImplementation(async () => { entered.resolve(); await release.promise; return { kind: 'allow_direct' } })
+    popup.mockImplementation(async () => { entered.resolve(); await release.promise; return { kind: 'allow' } })
     const controller = new AbortController()
     const running = h.execute({ arguments: WIDER, signal: controller.signal })
     await entered.promise

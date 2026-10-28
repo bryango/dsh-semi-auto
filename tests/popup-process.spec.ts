@@ -153,7 +153,7 @@ process.stdin.on('end', () => {
 describe('popup runner with managed local processes', () => {
   it.each([
     ['allow', 'bash'],
-    ['allow_direct', 'edit'],
+    ['allow', 'edit'],
     ['allow', 'write'],
     ['allow', 'mcp__fixture__inspect'],
   ])('preserves %s for %s only after exact argv and stdin validation', async (behavior, toolName) => {
@@ -186,7 +186,7 @@ describe('popup runner with managed local processes', () => {
     await f.assertDrained(await f.ready())
   })
 
-  it.each(['nonzero', 'malformed'])('rejects %s output even after valid request delivery', async behavior => {
+  it.each(['nonzero', 'malformed', 'allow_direct'])('rejects %s output even after valid request delivery', async behavior => {
     const f = await fixture(behavior)
     const result = await runPopup(f.runtime, f.request, f.config, new AbortController().signal)
     expect(result).toEqual({ kind: 'deny', reason: expect.any(String) })

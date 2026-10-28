@@ -6,7 +6,6 @@ export const POPUP_INPUT_LIMIT_BYTES = 8 * 1024 * 1024
 /** A positive decision authorizes only the corresponding caller-controlled path. */
 export type HumanDecision =
   | { readonly kind: 'allow' }
-  | { readonly kind: 'allow_direct' }
   | { readonly kind: 'no_decision' }
   | { readonly kind: 'deny'; readonly reason: string }
 
@@ -152,7 +151,6 @@ export function decodePopupOutput(stdout: string): HumanDecision {
   if (Object.hasOwn(decision, 'message') && typeof decision['message'] !== 'string') return invalid
   switch (decision['behavior']) {
     case 'allow': return { kind: 'allow' }
-    case 'allow_direct': return { kind: 'allow_direct' }
     case 'deny': return {
       kind: 'deny',
       reason: typeof decision['message'] === 'string' && decision['message'].trim() !== ''

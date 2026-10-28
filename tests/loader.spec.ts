@@ -38,7 +38,7 @@ async function boot(patches: PatchOptions[] = []) {
   const popupPath = join(directory, 'permission-popup')
   const requestsPath = join(directory, 'popup-requests.jsonl')
   const directAllow = JSON.stringify({
-    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow_direct' } },
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
   })
   await writeFile(popupPath, [
     '#!/bin/sh',

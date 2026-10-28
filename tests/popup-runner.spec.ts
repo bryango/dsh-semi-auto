@@ -56,9 +56,9 @@ describe('trusted native popup runner', () => {
     expect(f.spawn.mock.calls[0]?.[0]).not.toHaveProperty('env')
   })
 
-  it('preserves explicit direct authorization without executing any tool', async () => {
+  it('rejects the removed allow_direct response', async () => {
     const f = fixture({ output: allow.replace('"allow"', '"allow_direct"') })
-    expect(await runPopup(f.runtime, request, config, new AbortController().signal)).toEqual({ kind: 'allow_direct' })
+    expect(await runPopup(f.runtime, request, config, new AbortController().signal)).toEqual({ kind: 'deny', reason: expect.any(String) })
   })
 
   it('preserves no decision only after a successful empty helper exit and cleanup', async () => {

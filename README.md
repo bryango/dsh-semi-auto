@@ -19,9 +19,9 @@
 
 原生有效提权审批
   → permission-popup --host dsh
-      ├─ Auto review / allow → vendored official Auto reviewer → allowed-once
+      ├─ Auto review / exit 0 + empty stdout → vendored official Auto reviewer → allowed-once
       ├─ disabled popup / exit 0 + empty stdout → Auto reviewer → allowed-once
-      ├─ Authorize / allow_direct → allowed-once
+      ├─ Authorize / allow → allowed-once
       └─ Deny / invalid output / failure / timeout → reject
 ```
 
@@ -85,7 +85,10 @@ popup 托盘配置 `enabled: false` 时，binary 正常退出且 stdout 为空�
 
 **只支持 DSH `0.2.1-rc.3`，本地 macOS 标准 profile。**
 需要可用的原生 `permission-popup --host dsh` 和当前会话的 LLM provider。
-popup 必须支持 `allow`、`allow_direct` 和 `deny` 三种 DSH 响应。
+升级此协议时，先停止当前工具任务并关闭插件 entry，再一起替换 popup 与插件并重新启用。
+不要混用旧 popup 和新插件：旧 `allow` 表示交给 Auto review，新 `allow` 表示直接授权。
+popup 使用与 Codex 相同的决定：空 stdout 表示交给 Auto review，`allow` 表示直接授权，`deny` 表示拒绝。
+旧的 `allow_direct` 响应不再支持。
 
 先构建安装包：
 

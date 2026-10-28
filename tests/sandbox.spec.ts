@@ -161,7 +161,7 @@ async function harness(mode: 'read-only' | 'workspace-write' = 'workspace-write'
 }
 
 beforeEach(() => {
-  popup.mockReset().mockResolvedValue({ kind: 'allow' })
+  popup.mockReset().mockResolvedValue({ kind: 'no_decision' })
   reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
 })
 
@@ -247,7 +247,7 @@ describe('Semi Auto with real rc3 sandboxed filesystem execution', () => {
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
-  it.each(['allow', 'allow_direct'] as const)('human %s grants only one explicit outside-workspace write', async (kind) => {
+  it.each(['no_decision', 'allow'] as const)('human %s grants only one explicit outside-workspace write', async (kind) => {
     const h = await harness()
     popup.mockResolvedValue({ kind })
     const path = join(h.outside, 'protected.txt')
@@ -257,14 +257,14 @@ describe('Semi Auto with real rc3 sandboxed filesystem execution', () => {
     expect(await readFile(path, 'utf8')).toBe('one-time write')
     expect(h.policies[0]).toMatchObject({ mode: 'danger-full-access' })
     expect(popup).toHaveBeenCalledTimes(1)
-    expect(reviewer).toHaveBeenCalledTimes(kind === 'allow' ? 1 : 0)
+    expect(reviewer).toHaveBeenCalledTimes(kind === 'no_decision' ? 1 : 0)
     expect(h.ctx.sandboxPolicy.resolve({ session: h.session }).mode).toBe('workspace-write')
     expect(h.ctx.approval.overrideOf(h.session) ?? h.ctx.approval.config.policy).toBe('ask')
     expect((await h.execute(path, 'ordinary retry must fail')).isError).toBe(true)
     expect(await readFile(path, 'utf8')).toBe('one-time write')
     expect(h.policies[1]).toMatchObject({ mode: 'workspace-write' })
     expect(popup).toHaveBeenCalledTimes(1)
-    expect(reviewer).toHaveBeenCalledTimes(kind === 'allow' ? 2 : 1)
+    expect(reviewer).toHaveBeenCalledTimes(kind === 'no_decision' ? 2 : 1)
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 

@@ -47,7 +47,7 @@ Before accepting an update:
 3. Keep upstream policy/classification changes in the pristine snapshot and generated output. Restrict local changes to the documented adapter and avoid automatic fallbacks for unknown formats.
 4. Review the upstream license and update [third-party notices](<THIRD_PARTY_NOTICES.md>) if required.
 5. Update [vendor tests](<tests/vendor.spec.ts>) when intentionally adopting a new baseline; they pin the initial commit, version, and complete file length. Do not change these assertions to accept arbitrary versions.
-6. Run the repository's typecheck, tests, and build, plus `node scripts/generate-reviewer.mjs --check`. Verify human allow → Auto allow/deny, direct allow → no Auto, cancellation, malformed reviewer output, native calls, PTC inner calls, and sandbox denial. Verify no built-in approval prompt can follow a reviewer denial.
+6. Run the repository's typecheck, tests, and build, plus `node scripts/generate-reviewer.mjs --check`. Verify popup no decision → Auto allow/deny, explicit allow → no Auto, cancellation, malformed reviewer output, native calls, PTC inner calls, and sandbox denial. Verify no built-in approval prompt can follow a reviewer denial.
 7. Commit snapshots, metadata, generator changes, generated source, tests, and compatibility declarations together.
 
 [Vendor tests](<tests/vendor.spec.ts>) recompute hashes and compare expected generated text without writing files or running a build. They also assert that policy/classification remain intact and the generated module has no stock preset registration or `ask` decision path.

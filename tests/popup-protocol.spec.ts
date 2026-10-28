@@ -73,7 +73,7 @@ describe('popup request protocol', () => {
 })
 
 describe('popup response protocol', () => {
-  it.each(['allow', 'allow_direct'] as const)('accepts only explicit %s', behavior => {
+  it.each(['allow'] as const)('accepts only explicit %s', behavior => {
     expect(decodePopupOutput(`${output(behavior)}\n`)).toEqual({ kind: behavior })
   })
 
@@ -94,7 +94,7 @@ describe('popup response protocol', () => {
     JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: null } }),
     JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' }, extra: true } }),
     JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } }, continue: true }),
-    output('continue'), output('ALLOW'), output('allow', { message: false }),
+    output('allow_direct'), output('continue'), output('ALLOW'), output('allow', { message: false }),
     output('allow', { updatedInput: { command: 'different' } }), output('allow', { permissionDecision: 'deny' }),
   ])('fails closed for malformed or unsupported responses: %s', text => {
     expect(decodePopupOutput(text)).toEqual({ kind: 'deny', reason: 'Permission popup returned an invalid authorization response.' })
