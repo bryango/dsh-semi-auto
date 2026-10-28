@@ -157,7 +157,7 @@ window.__ModuleLoader__.load({
               return value.enabled === true;
             },
           }),
-        }), SemiAutoToggle);
+        }, SemiAutoToggle));
       },
     };
   },

@@ -79,6 +79,8 @@ export function apply(ctx: Context, config: Config): void {
   const lifecycle = new AbortController()
   const active = new Set<Promise<void>>()
   const operations = new Map<ToolExecution, Operation>()
+  // A toggle changes admission for new calls, not ownership of in-flight ones.
+  const callModes = new Map<ToolExecution, boolean>()
   const failure = (exec: ToolExecution): string | undefined => {
     if (!accepting || lifecycle.signal.aborted) return 'Semi Auto is stopping; retry after it has finished disabling.'
     if (exec.agent === undefined) return 'Semi Auto requires an agent-owned execution.'
@@ -111,15 +113,16 @@ export function apply(ctx: Context, config: Config): void {
   ctx.effect(function* () {
     yield ctx.on('subagent/provider-added', assertLocalProvider, { prepend: true })
     yield tools.guard(exec => {
-      if (!enabled) return undefined
+      if (!(callModes.get(exec) ?? enabled)) return undefined
       return failure(exec) ?? (operations.get(exec)?.authorized ? undefined : 'Semi Auto review did not complete for this call.')
     })
-    yield ctx.on('tools/result', exec => { release(exec) })
+    yield ctx.on('tools/result', exec => { release(exec); callModes.delete(exec) })
     const releaseOrphans = (agent: ToolExecution['agent']): void => {
-      for (const [exec, operation] of operations) {
+      for (const exec of callModes.keys()) {
         if (exec.agent !== agent) continue
-        operation.controller.abort(new Error('Semi Auto owning agent settled'))
+        operations.get(exec)?.controller.abort(new Error('Semi Auto owning agent settled'))
         release(exec)
+        callModes.delete(exec)
       }
     }
     yield ctx.on('agent/status', ({ agent, status }) => { if (status === 'idle') releaseOrphans(agent) })
@@ -131,12 +134,15 @@ export function apply(ctx: Context, config: Config): void {
       }
     })
     yield ctx.on('approval/request', async (request, next): Promise<ApprovalOutcome> => {
-      // Off mode restores the native approval chain untouched.
-      if (!enabled) return next()
       // Native ApprovalService owns the ask/decision audit and rejects never
-      // before answerer dispatch. Do not call next(): there is one human UI.
-      const matches = [...operations].filter(([exec, operation]) => exec.agent === request.agent
-        && exec.callId === request.callId && exec.name === request.toolName && operation.phase === 'dispatch')
+      // before answerer dispatch. Ownership also covers pre-dispatch asks.
+      const sameCall = (exec: ToolExecution): boolean => exec.agent === request.agent
+        && exec.callId === request.callId && exec.name === request.toolName
+      const admitted = [...callModes].filter(([exec]) => sameCall(exec))
+      if (admitted.length > 1) return 'rejected'
+      if (admitted[0]?.[1] === false) return next()
+      if (admitted.length === 0 && !enabled) return next()
+      const matches = [...operations].filter(([exec, operation]) => sameCall(exec) && operation.phase === 'dispatch')
       const match = matches.length === 1 ? matches[0] : undefined
       if (match === undefined) return 'rejected'
       const [exec, operation] = match
@@ -180,12 +186,13 @@ export function apply(ctx: Context, config: Config): void {
       }
     }, { prepend: true })
     yield ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
-      // Off mode is a pure passthrough: no operation tracking, no review.
+      // Remember admission even if a downstream gate waits across a toggle.
+      callModes.set(exec, enabled)
       if (!enabled) return next()
       const reason = failure(exec)
       if (reason !== undefined) return { kind: 'deny', reason }
       const wider = isWidening(exec)
-      if ([...operations.keys()].some(other => other.agent === exec.agent && other.callId === exec.callId)) {
+      if ([...callModes.keys()].some(other => other !== exec && other.agent === exec.agent && other.callId === exec.callId)) {
         return { kind: 'deny', reason: 'Semi Auto cannot authorize an ambiguous tool call identity.' }
       }
       const settled = Promise.withResolvers<void>()
@@ -224,7 +231,7 @@ export function apply(ctx: Context, config: Config): void {
       }
     }, { prepend: true })
     yield ctx.on('tools/execute', async (exec, next) => {
-      if (!enabled) return next()
+      if (!(callModes.get(exec) ?? enabled)) return next()
       const operation = operations.get(exec)
       const reason = failure(exec)
       if (reason !== undefined || operation?.authorized !== true) throw new Error(reason ?? 'Semi Auto review did not complete for this call.')

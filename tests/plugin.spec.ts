@@ -719,6 +719,119 @@ describe('Composer mode toggle', () => {
     expect(h.builtIn).toHaveBeenCalledOnce()
   })
 
+  it.each([
+    [false, {}], [false, WIDER], [true, {}], [true, WIDER],
+  ] as const)('keeps mode %s for a prepared call with arguments %j after a toggle', async (initial, args) => {
+    const h = await harness()
+    await h.setMode(initial)
+    const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    const prepared = await scheduler.prepare({
+      name: 'probe', arguments: args, signal: new AbortController().signal,
+      callId: ToolCallId('toggle-gap'), agent: h.agent,
+    })
+    if (prepared.kind !== 'dispatch') throw new Error('Expected prepared dispatch')
+    let finalized = false
+    try {
+      await h.setMode(!initial)
+      const dispatched = await scheduler.dispatch(prepared.exec)
+      if (dispatched.kind === 'post-result') await scheduler.finalize(prepared.exec, dispatched.result)
+      else scheduler.finish(prepared.exec, dispatched.result)
+      finalized = true
+      expect(dispatched.result.isError).toBe(false)
+      expect(reviewer).toHaveBeenCalledTimes(initial ? 1 : 0)
+      expect(popup).toHaveBeenCalledTimes(initial && args === WIDER ? 1 : 0)
+      expect(h.builtIn).toHaveBeenCalledTimes(!initial && args === WIDER ? 1 : 0)
+    } finally { if (!finalized) finishPrepared(h, prepared.exec) }
+  })
+
+  it('does not reclassify an off call when enabled during downstream pre-execute', async () => {
+    const h = await harness()
+    await h.setMode(false)
+    h.ctx.on('tools/pre-execute', async (_exec, next) => {
+      await h.setMode(true)
+      return next()
+    })
+    expect((await h.execute()).isError).toBe(false)
+    expect(reviewer).not.toHaveBeenCalled()
+    expect(h.effect).toHaveBeenCalledOnce()
+  })
+
+  it.each([false, true])('keeps mode %s for downstream pre-execute approval across a toggle', async initial => {
+    const h = await harness()
+    await h.setMode(initial)
+    h.ctx.on('tools/pre-execute', async (): Promise<PreToolDecision> => {
+      await h.setMode(!initial)
+      return { kind: 'ask', reason: 'independent policy question' }
+    })
+    expect((await h.execute()).isError).toBe(initial)
+    expect(h.builtIn).toHaveBeenCalledTimes(initial ? 0 : 1)
+    expect(reviewer).toHaveBeenCalledTimes(initial ? 1 : 0)
+    expect(popup).not.toHaveBeenCalled()
+    expect(h.effect).toHaveBeenCalledTimes(initial ? 0 : 1)
+  })
+
+  it('keeps a native approval native when enabled after its body starts', async () => {
+    const h = await harness()
+    await h.setMode(false)
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const body = h.body.getMockImplementation()!
+    h.body.mockImplementation(async (args, exec) => {
+      entered.resolve()
+      await release.promise
+      return body(args, exec)
+    })
+    const running = h.execute({ arguments: WIDER })
+    try {
+      await entered.promise
+      await h.setMode(true)
+    } finally { release.resolve() }
+    expect((await running).isError).toBe(false)
+    expect(h.builtIn).toHaveBeenCalledOnce()
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).not.toHaveBeenCalled()
+  })
+
+  it('does not reuse native ownership for a later call with the same id', async () => {
+    const h = await harness()
+    const callId = ToolCallId('reused-native-id')
+    await h.setMode(false)
+    expect((await h.execute({ arguments: WIDER, callId })).isError).toBe(false)
+    await h.setMode(true)
+    expect((await h.execute({ arguments: WIDER, callId })).isError).toBe(false)
+    expect(h.builtIn).toHaveBeenCalledOnce()
+    expect(popup).toHaveBeenCalledOnce()
+    expect(reviewer).toHaveBeenCalledOnce()
+  })
+
+  it('rejects a managed call that collides with a still-prepared native call', async () => {
+    const h = await harness()
+    await h.setMode(false)
+    const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    const callId = ToolCallId('mixed-mode-id')
+    const prepared = await scheduler.prepare({
+      name: 'probe', arguments: WIDER, signal: new AbortController().signal, callId, agent: h.agent,
+    })
+    if (prepared.kind !== 'dispatch') throw new Error('Expected prepared native dispatch')
+    try {
+      await h.setMode(true)
+      expect((await h.execute({ arguments: WIDER, callId })).isError).toBe(true)
+      expect(popup).not.toHaveBeenCalled()
+      expect(reviewer).not.toHaveBeenCalled()
+      expect(h.builtIn).not.toHaveBeenCalled()
+    } finally { finishPrepared(h, prepared.exec) }
+  })
+
+  it('persists the last accepted concurrent toggle through a restart', async () => {
+    const h = await harness()
+    const results = await Promise.allSettled(Array.from({ length: 20 }, (_, index) => h.setMode(index % 2 === 0)))
+    expect(results.every(result => result.status === 'fulfilled')).toBe(true)
+    expect(await h.rpcCall('/api/semi-auto.get', {})).toEqual({ enabled: false })
+    await h.plugin!.dispose()
+    await h.enable()
+    expect(await h.rpcCall('/api/semi-auto.get', {})).toEqual({ enabled: false })
+  })
+
   it('reports the current mode through the get endpoint', async () => {
     const h = await harness()
     await h.setMode(false)

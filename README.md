@@ -61,9 +61,11 @@
 - 关闭时插件完全让位：不做 Auto review、不弹 popup、不注册 guard 拒绝，
   原生审批 answerer 链原样接管（`approval/request` 直接 `next()`）；
   正在进行的审核与弹窗自然完成，不中断。
-- 开启后新调用立即恢复原有行为。
+- 切换只影响新进入 pre-execute 的调用；已准备或正在执行的调用保持原有审批路径。
+  开启后新调用立即恢复原有行为。
 - 模式持久化在 `$DSH_HOME`（默认 `~/.dsh`）下的
   `plugins/semi-auto/mode.json`；文件缺失或损坏时默认开启。
+  并发切换按接收顺序串行写入，避免临时文件冲突和重启后状态回退。
 - 开关通过共享 `/api` 通道的 `semi-auto.get`／`semi-auto.set` 端点读写；
   `set` 仅接受布尔 `enabled`。headless 组合没有 connection 服务，不挂路由。
 

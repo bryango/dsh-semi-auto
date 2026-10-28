@@ -34,6 +34,23 @@ describe('durable mode state', () => {
     expect(readModeFileSync()).toBe(true)
   })
 
+  it('persists concurrent writes in acceptance order without sharing an in-flight temp file', async () => {
+    const results = await Promise.allSettled(Array.from({ length: 20 }, (_, index) => writeModeFile(index % 2 === 0)))
+    expect(results.every(result => result.status === 'fulfilled')).toBe(true)
+    expect(readModeFileSync()).toBe(false)
+  })
+
+  it('can persist a later toggle after an earlier write fails', async () => {
+    const home = process.env.DSH_HOME!
+    const blockedHome = join(home, 'not-a-directory')
+    await writeFile(blockedHome, 'blocked', 'utf8')
+    process.env.DSH_HOME = blockedHome
+    await expect(writeModeFile(false)).rejects.toThrow()
+    process.env.DSH_HOME = home
+    await writeModeFile(false)
+    expect(readModeFileSync()).toBe(false)
+  })
+
   it('defaults to enabled on a corrupt state file instead of failing activation', async () => {
     await writeModeFile(false)
     await writeFile(join(process.env.DSH_HOME!, 'plugins', 'semi-auto', 'mode.json'), 'not json', 'utf8')

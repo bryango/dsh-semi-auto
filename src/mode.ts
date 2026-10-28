@@ -27,14 +27,18 @@ export function readModeFileSync(): boolean {
   }
 }
 
-/**
- * Persist the mode atomically (tmp file + rename). Callers await it on the RPC
- * failure path; the in-memory flip must never wait on disk.
- */
-export async function writeModeFile(enabled: boolean): Promise<void> {
+let pendingWrite = Promise.resolve()
+
+/** Persist accepted flips in order; RPC callers await their own atomic write. */
+export function writeModeFile(enabled: boolean): Promise<void> {
   const file = modeFile()
-  await mkdir(dirname(file), { recursive: true })
-  const tmp = `${file}.tmp`
-  await writeFile(tmp, `${JSON.stringify({ enabled })}\n`, 'utf8')
-  await rename(tmp, file)
+  const write = pendingWrite.then(async () => {
+    await mkdir(dirname(file), { recursive: true })
+    const tmp = `${file}.tmp`
+    await writeFile(tmp, `${JSON.stringify({ enabled })}\n`, 'utf8')
+    await rename(tmp, file)
+  })
+  // A failed write must not prevent a later toggle from being persisted.
+  pendingWrite = write.catch(() => {})
+  return write
 }
