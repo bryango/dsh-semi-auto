@@ -85,7 +85,10 @@ popup 托盘配置 `enabled: false` 时，binary 正常退出且 stdout 为空�
 
 ## 启用与关闭
 
-**只支持 DSH `0.2.1-rc.3`，本地 macOS 标准 profile。**
+**支持 DSH `0.2.1-rc.3` 和 `0.2.1-rc.5`，本地 macOS 标准 profile；当前开发依赖和测试基线为 rc.5。**
+已核对官方 commit `b830ec950faba0a46dda564be3e2d854afed94f1` 的实际源码和发布类型；
+核对的 approval、agent/tools、sandbox、hook-protocol/hooks、Connection RPC 和 remote API 相比 rc.3 无源码变更，
+输入框开关的 slot 也未改变，因此保留本地审批和开关逻辑。
 需要可用的原生 `permission-popup --host dsh` 和当前会话的 LLM provider。
 升级此协议时，先停止当前工具任务并关闭插件 entry，再一起替换 popup 与插件并重新启用。
 不要混用旧 popup 和新插件：旧 `allow` 表示交给 Auto review，新 `allow` 表示直接授权。
@@ -200,7 +203,7 @@ pnpm build
 node scripts/generate-reviewer.mjs --check
 ```
 
-测试包括严格 popup 协议、进程取消/清理、真实 Cordis/rc3 工具执行、
+测试包括严格 popup 协议、进程取消/清理、真实 Cordis/rc5 工具执行、
 三按钮顺序、权限变化和卸载竞态、官方 reviewer 的持久化历史重建、
 PTC inner-call 校验、真实 filesystem workspace/outside-workspace 写入。
 测试不调用真实 LLM，不自动操作 AppKit 窗口。

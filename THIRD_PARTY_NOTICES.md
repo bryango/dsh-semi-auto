@@ -9,8 +9,8 @@ including it in this GPLv3 project does not replace its upstream license.
 This project includes a complete source snapshot of the official DeepSeek Harness Auto reviewer and a mechanically adapted runtime derivative.
 
 - Upstream: <https://github.com/deepseek-ai/deepseek-harness>
-- Version: `0.2.1-rc.3`
-- Commit: `1f81c047fc48fa190a683e469daa699857e9afe8`
+- Version: `0.2.1-rc.5`
+- Commit: `b830ec950faba0a46dda564be3e2d854afed94f1`
 - Original source: `packages/experimental/auto-review/src/index.ts`
 - Copyright: **Copyright (c) 2026 DeepSeek**
 - License: **MIT**; the complete original notice and license are preserved in [vendor/upstream/LICENSE](<vendor/upstream/LICENSE>).

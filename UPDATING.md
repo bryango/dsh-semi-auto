@@ -2,7 +2,12 @@
 
 ## Supported baseline
 
-The initial compatibility target is DeepSeek Harness **0.2.1-rc.3**, commit `1f81c047fc48fa190a683e469daa699857e9afe8`. Updating the snapshot does not by itself make this plugin compatible with another Harness version. Review its public APIs and dependency pins, then run the integration tests before changing the declared compatibility.
+The current development and test baseline is DeepSeek Harness **0.2.1-rc.5**, commit `b830ec950faba0a46dda564be3e2d854afed94f1`.
+The declared engine and service peers retain support for **0.2.1-rc.3**; development service identities and their peer closure are pinned to rc.5 to prevent mixed branded types.
+The rc.3 → rc.5 review found no source changes to the reviewed agent, tools, approval, sandbox, subagent, subprocess, hook-protocol, hooks, Connection RPC, or remote APIs; the composer slot is unchanged.
+The official reviewer and license snapshots are byte-for-byte unchanged from rc.3; only their recorded release and commit advance.
+Updating the snapshot does not by itself make this plugin compatible with another Harness version.
+Review its public APIs and published dependency types, then run the integration tests before changing the declared compatibility.
 
 [Upstream metadata](<vendor/upstream.json>) records the repository, package version, exact commit, original paths, and SHA-256 hashes. The [complete reviewer snapshot](<vendor/upstream/auto-review.ts>) and [license](<vendor/upstream/LICENSE>) are byte-for-byte Git blobs, including the original plugin lifecycle. They are not runtime modules and must not be edited by hand.
 

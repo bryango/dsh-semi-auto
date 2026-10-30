@@ -1,5 +1,5 @@
 /**
- * Generated from DeepSeek Harness 0.2.1-rc.3 (1f81c047fc48fa190a683e469daa699857e9afe8).
+ * Generated from DeepSeek Harness 0.2.1-rc.5 (b830ec950faba0a46dda564be3e2d854afed94f1).
  * Copyright (c) 2026 DeepSeek; MIT license, see vendor/upstream/LICENSE.
  * Do not edit: run scripts/generate-reviewer.mjs. Local adaptation: UPDATING.md.
  * The upstream full-host risk assumption is retained; execution stays sandboxed by the caller.

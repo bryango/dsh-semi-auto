@@ -106,7 +106,7 @@ async function harness(mode: 'read-only' | 'workspace-write' = 'workspace-write'
     policies.push(policy)
     const target = await ctx.fs.resolve(path, { cwd: workspace, signal })
     try {
-      // This is the actual rc3 filesystem mutation, not a simulated tool result.
+      // This is the actual rc5 filesystem mutation, not a simulated tool result.
       await ctx.fs.writeText(target, content, undefined, signal, policy)
     } catch (error) {
       failures.push(error)
@@ -181,7 +181,7 @@ afterEach(async () => {
   }
 })
 
-describe('Semi Auto with real rc3 sandboxed filesystem execution', () => {
+describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
   it('reviews an actual workspace-local write without opening the popup', async () => {
     const h = await harness()
     const path = join(h.workspace, 'created.txt')
