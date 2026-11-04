@@ -8,21 +8,21 @@ import { ToolCallId, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import PermissionPresetService from '@deepseek-ai/dsh-permission-presets'
 import { approveEscalation, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
 import SandboxPolicyService, { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
-import SessionStore, { SessionId, type Session } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SubagentRuntime, { NO_START_CAPABILITIES, type SubagentProvider } from '@deepseek-ai/dsh-subagent'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, {
-  defineContentToolFixture, RUN_CODE_NAME, TOOL_RUNTIME_SCHEDULER,
-  type PreToolDecision, type ToolExecution, type ToolExecutionInput, type ToolExecutionToken, type ToolRunContext,
+  defineContentToolFixture, TOOL_RUNTIME_SCHEDULER,
+  type PreToolDecision, type ToolExecutionInput, type ToolExecutionToken, type ToolRunContext,
 } from '@deepseek-ai/dsh-tools'
 import ApprovalService, { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import * as SemiAuto from '../src/index.js'
-import { isAutoReviewCandidate, reviewTool } from '../src/auto-review.js'
+import { reviewTool } from '../src/auto-review.js'
 import { runPopup } from '../src/popup-runner.js'
 
-// Only authorization I/O is mocked; candidate selection and all policy/execution services are real.
+// Only authorization I/O is mocked; native approval, dispatch and policy services are real.
 vi.mock('../src/auto-review.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/auto-review.js')>(), reviewTool: vi.fn(),
 }))
@@ -34,6 +34,9 @@ const CONFIG: SemiAuto.Config = {
   permissionPopupPath: '/test/permission-popup', popupTimeoutMs: 600000,
   processGraceMs: 1000, outputLimitBytes: 65536,
 }
+const WIDER = { sandbox_permissions: 'danger-full-access', justification: 'Perform the explicitly requested operation.' }
+const FULL_REASON = `escalate sandbox to danger-full-access: ${WIDER.justification}`
+const APPROVAL = { requestedMode: 'danger-full-access' as const, reason: FULL_REASON }
 class FixtureShell extends Service {
   readonly sandboxMode = 'workspace-write'
   constructor(ctx: Context) { super(ctx, 'shell') }
@@ -71,7 +74,6 @@ class FixtureConnection extends Service {
 }
 interface PluginHandle { dispose(): Promise<void> }
 interface Args { sandbox_permissions?: string; justification?: string }
-const WIDER = { sandbox_permissions: 'danger-full-access', justification: 'Perform the explicitly requested operation.' }
 
 async function harness(options: { enable?: boolean; external?: boolean; remoteSubprocess?: boolean; mode?: 'read-only' | 'workspace-write' } = {}) {
   const ctx = new Context()
@@ -101,7 +103,6 @@ async function harness(options: { enable?: boolean; external?: boolean; remoteSu
   if (options.external) ctx.subagents.registerProvider(externalProvider())
   const session = ctx.sessions.create(SessionId('existing'), { meta: { cwd: '/workspace' } })
   session.append('turn/start', { turn: 1 })
-  // Match upstream executor tests: no full loop is needed for scoped identity or this fixture's open turn.
   const agent = { id: session.id, session, ctx, options: { provider: 'fixture', model: 'fixture' } } as Agent
   const effect = vi.fn((_mode: string) => undefined)
   const body = vi.fn(async (args: Args, exec: ToolRunContext): Promise<ContentBlock[]> => {
@@ -122,6 +123,11 @@ async function harness(options: { enable?: boolean; external?: boolean; remoteSu
     parameters: { sandbox_permissions: { type: 'string' }, justification: { type: 'string' } },
     execute: (args, exec) => body(args, exec),
   }))
+  // No permission fields in either the schema or arguments: approval is requested by the body.
+  ctx.tools.register(defineContentToolFixture({
+    name: 'implicit', description: 'An implicit native full-access operation', parameters: {},
+    execute: (_args, exec) => body(WIDER, exec),
+  }))
   const builtIn = vi.fn(async () => 'allowed-once' as const)
   ctx.on('approval/request', builtIn)
   const enable = async (): Promise<PluginHandle> => ctx.plugin(SemiAuto, CONFIG)
@@ -131,22 +137,13 @@ async function harness(options: { enable?: boolean; external?: boolean; remoteSu
     name: 'probe', arguments: {}, signal: new AbortController().signal,
     callId: ToolCallId(`call-${++call}`), agent, ...changes,
   })
-  const setMode = async (enabled: boolean): Promise<void> => {
-    await connection.call('/api/semi-auto.set', { enabled })
-  }
+  const setMode = async (enabled: boolean): Promise<void> => { await connection.call('/api/semi-auto.set', { enabled }) }
   const rpcCall = (path: string, payload: unknown): Promise<unknown> => connection.call(path, payload)
   return { ctx, session, agent, body, effect, builtIn, plugin, enable, execute, setMode, rpcCall }
 }
 function externalProvider(name = 'external'): SubagentProvider {
   return { name, capabilities: NO_START_CAPABILITIES, inheritsParentContext: false,
     start: vi.fn(async () => { throw new Error('External process must not start') }) }
-}
-function decisionExecution(agent: Agent, name: string, args: Args = {}, parent?: ToolExecutionToken): ToolExecution {
-  return {
-    name, agent, callId: ToolCallId('waterfall'), rootCallId: ToolCallId('waterfall'),
-    token: Symbol('waterfall fixture') as ToolExecutionToken,
-    arguments: args, signal: new AbortController().signal, ...parent === undefined ? {} : { parent },
-  }
 }
 function expectPolicy(h: Awaited<ReturnType<typeof harness>>, mode: string, policy = 'ask') {
   expect(h.ctx.sandboxPolicy.resolve({ session: h.session }).mode).toBe(mode)
@@ -155,21 +152,25 @@ function expectPolicy(h: Awaited<ReturnType<typeof harness>>, mode: string, poli
 function finishPrepared(h: Awaited<ReturnType<typeof harness>>, exec: ToolRunContext) {
   h.ctx.tools[TOOL_RUNTIME_SCHEDULER].finish(exec, { content: [], isError: true, error: { message: 'fixture cleanup' } })
 }
+function nativeRequest(h: Awaited<ReturnType<typeof harness>>, exec: ToolRunContext, reason = FULL_REASON) {
+  return { agent: h.agent, toolName: exec.name, callId: exec.callId, signal: exec.signal, reason }
+}
 const modeHomes: string[] = []
 beforeEach(async () => {
-  popup.mockReset().mockResolvedValue({ kind: 'no_decision' }); reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
-  // Keep the mode state off the developer's real ~/.dsh for every test here.
+  popup.mockReset().mockResolvedValue({ kind: 'no_decision' })
+  reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
   modeHomes.push(await mkdtemp(join(tmpdir(), 'semi-auto-plugin-')))
   process.env.DSH_HOME = modeHomes[modeHomes.length - 1]
 })
 afterEach(async () => {
+  while (contexts.length) await contexts.pop()!.fiber.dispose()
   delete process.env.DSH_HOME
   while (modeHomes.length) await rm(modeHomes.pop()!, { recursive: true, force: true })
-  while (contexts.length) await contexts.pop()!.fiber.dispose(); vi.restoreAllMocks()
+  vi.restoreAllMocks()
 })
 
-describe('Auto within the standing sandbox and popup only for native widening approval', () => {
-  it.each(['read-only', 'workspace-write'] as const)('preserves native %s and ask through enable, new session and disable', async (mode) => {
+describe('only native danger-full-access approval is intercepted', () => {
+  it.each(['read-only', 'workspace-write'] as const)('preserves native %s and ask through enable, new session and disable', async mode => {
     const h = await harness({ enable: false, mode })
     const before = h.session.snapshotEvents().length
     const plugin = await h.enable()
@@ -182,313 +183,245 @@ describe('Auto within the standing sandbox and popup only for native widening ap
     expectPolicy(h, mode)
     expect(h.session.snapshotEvents().slice(before).filter(event => event.type === 'approval/policy' || event.type === 'sandbox/mode')).toEqual([])
   })
-  it('preserves a native never policy instead of enabling approval', async () => {
-    const h = await harness({ enable: false })
-    setApprovalPolicy(h.session, 'never')
-    const plugin = await h.enable()
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(true)
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
-    expect(h.builtIn).not.toHaveBeenCalled()
-    expect(h.effect).not.toHaveBeenCalled()
-    await plugin.dispose()
-    expectPolicy(h, 'workspace-write', 'never')
-  })
-  it.each(['read-only', 'workspace-write'] as const)('Auto reviews normal %s calls without popup', async (mode) => {
-    const h = await harness({ mode })
+
+  it.each(['read-only', 'workspace-write', 'danger-full-access'] as const)('passes ordinary %s calls directly without review or popup', async mode => {
+    const h = await harness()
+    setSandboxMode(h.session, mode)
     expect((await h.execute()).isError).toBe(false)
-    expect(reviewer).toHaveBeenCalledTimes(1)
-    expect(popup).not.toHaveBeenCalled()
     expect(h.effect).toHaveBeenCalledWith(mode)
-  })
-  it.each([
-    ['no escalation fields', {}],
-    ['only sandbox_permissions', { sandbox_permissions: { type: 'string' as const } }],
-    ['only justification', { justification: { type: 'string' as const } }],
-  ] as const)('does not let wider extras bypass Auto on an ordinary tool declaring %s', async (_label, parameters) => {
-    const h = await harness()
-    const ordinaryBody = vi.fn(async (): Promise<ContentBlock[]> => [{ type: 'text', text: 'ordinary effect' }])
-    h.ctx.tools.register(defineContentToolFixture({
-      name: 'ordinary', description: 'Ignores unknown root arguments', parameters, execute: ordinaryBody,
-    }))
-    // Root schemas accept extra keys. Their names do not turn this tool into a
-    // native widening operation or authorize skipping its ordinary Auto review.
-    reviewer.mockResolvedValue({ kind: 'deny', reason: 'ordinary action rejected' })
-    const result = await h.execute({ name: 'ordinary', arguments: WIDER })
-    expect(result.isError).toBe(true)
-    expect(reviewer).toHaveBeenCalledOnce()
-    expect(reviewer.mock.calls[0]?.[1]).toMatchObject({ name: 'ordinary', arguments: WIDER })
-    expect(ordinaryBody).not.toHaveBeenCalled()
-    expect(popup).not.toHaveBeenCalled()
-    expect(h.builtIn).not.toHaveBeenCalled()
-  })
-  it('allows an ordinary open-schema tool with wider extras only after Auto, without popup', async () => {
-    const h = await harness()
-    const ordinaryBody = vi.fn(async (): Promise<ContentBlock[]> => [{ type: 'text', text: 'ordinary effect' }])
-    h.ctx.tools.register(defineContentToolFixture({
-      name: 'ordinary', description: 'Ignores unknown root arguments', parameters: {}, execute: ordinaryBody,
-    }))
-    const result = await h.execute({ name: 'ordinary', arguments: WIDER })
-    expect(result.isError).toBe(false)
-    expect(reviewer).toHaveBeenCalledOnce()
-    expect(ordinaryBody).toHaveBeenCalledOnce()
-    expect(popup).not.toHaveBeenCalled()
-    expect(h.builtIn).not.toHaveBeenCalled()
-    expectPolicy(h, 'workspace-write')
-  })
-  it('Auto reviews native and PTC inner calls independently without popup', async () => {
-    const h = await harness()
-    await h.execute()
-    const parent = Symbol('outer transport') as ToolExecutionToken
-    await h.execute({ parent, rootCallId: ToolCallId('outer') })
-    expect(reviewer).toHaveBeenCalledTimes(2)
-    expect(reviewer.mock.calls[1]?.[1].parent).toBe(parent)
-    expect(popup).not.toHaveBeenCalled()
-  })
-  it('skips only ordinary root run_code, including in the actual pre-execute waterfall', async () => {
-    const h = await harness()
-    const exec = decisionExecution(h.agent, RUN_CODE_NAME)
-    const downstream = vi.fn(async (): Promise<PreToolDecision> => ({ kind: 'allow' }))
-    expect(isAutoReviewCandidate(exec)).toBe(false)
-    expect(await h.ctx.waterfall('tools/pre-execute', exec, downstream)).toEqual({ kind: 'allow' })
-    h.ctx.emit('tools/result', exec, { content: [], value: null, isError: false })
-    expect(popup).not.toHaveBeenCalled()
     expect(reviewer).not.toHaveBeenCalled()
-    expect(downstream).toHaveBeenCalledOnce()
-  })
-  it('reviews the complete wider outer run_code after human approval, unlike ordinary outer transport', async () => {
-    const h = await harness()
-    // run_code is reserved and this harness has no PTC runtime. Supply only its
-    // trusted schema lookup while exercising the real public waterfalls below.
-    const get = h.ctx.tools.get.bind(h.ctx.tools)
-    const transportDefinition = {
-      ...get('probe', h.agent)!, name: RUN_CODE_NAME,
-      parameters: {
-        type: 'object',
-        properties: { sandbox_permissions: { type: 'string' }, justification: { type: 'string' } },
-      },
-    }
-    vi.spyOn(h.ctx.tools, 'get').mockImplementation((name, agent) => name === RUN_CODE_NAME
-      ? transportDefinition : get(name, agent))
-    const exec = decisionExecution(h.agent, RUN_CODE_NAME, WIDER)
-    try {
-      expect(await h.ctx.waterfall('tools/pre-execute', exec, async () => ({ kind: 'allow' }))).toEqual({ kind: 'allow' })
-      const result = await h.ctx.waterfall('tools/execute', exec, async () => {
-        const mode = await approveEscalation({
-          requestedMode: WIDER.sandbox_permissions, justification: WIDER.justification,
-          effectiveMode: 'workspace-write', subject: 'program',
-        }, { approver: h.ctx.approval, agent: h.agent, callId: exec.callId, toolName: exec.name, signal: exec.signal })
-        h.effect(mode)
-        return { content: [], value: null, isError: false as const }
-      })
-      expect(result.isError).toBe(false)
-      expect(popup).toHaveBeenCalledOnce()
-      expect(reviewer).toHaveBeenCalledOnce()
-      expect(reviewer.mock.calls[0]?.[1].name).toBe(RUN_CODE_NAME)
-      expect(reviewer.mock.calls[0]?.[1].parent).toBeUndefined()
-      expect(h.effect).toHaveBeenCalledWith('danger-full-access')
-      expectPolicy(h, 'workspace-write')
-    } finally {
-      h.ctx.emit('tools/result', exec, { content: [], value: null, isError: false })
-    }
-  })
-  it('makes ordinary Auto denial final without native or built-in approval', async () => {
-    const h = await harness()
-    reviewer.mockResolvedValue({ kind: 'deny', reason: 'reviewer refused' })
-    expect((await h.execute()).isError).toBe(true)
-    expect(h.body).not.toHaveBeenCalled()
+    expect(popup).not.toHaveBeenCalled()
     expect(h.builtIn).not.toHaveBeenCalled()
+  })
+
+  it('does not infer approval from parameter names, extra arguments or a nested call', async () => {
+    const h = await harness()
+    const ordinary = vi.fn(async (): Promise<ContentBlock[]> => [])
+    h.ctx.tools.register(defineContentToolFixture({ name: 'ordinary', description: 'No native approval', parameters: {}, execute: ordinary }))
+    const parent = Symbol('outer') as ToolExecutionToken
+    expect((await h.execute({ name: 'ordinary', arguments: WIDER })).isError).toBe(false)
+    expect((await h.execute({ parent, rootCallId: ToolCallId('outer') })).isError).toBe(false)
+    expect(ordinary).toHaveBeenCalledOnce()
+    expect(reviewer).not.toHaveBeenCalled()
     expect(popup).not.toHaveBeenCalled()
   })
-  it('defers wider-call review until native popup defers, then grants only the requested call', async () => {
+
+  it.each(['explicit', 'implicit'] as const)('passes complete %s approval context to popup and fourth reviewer argument, without changing execution args', async kind => {
     const h = await harness()
+    const args = kind === 'explicit' ? WIDER : {}
+    const name = kind === 'explicit' ? 'probe' : 'implicit'
+    const before = structuredClone(args)
     const order: string[] = []
     popup.mockImplementation(async () => { order.push('human'); return { kind: 'no_decision' } })
-    reviewer.mockImplementation(async () => { order.push('reviewer'); return { kind: 'allow' } })
+    reviewer.mockImplementation(async () => { order.push('review'); return { kind: 'allow' } })
     h.effect.mockImplementation(() => { order.push('effect') })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
-    expect(order).toEqual(['human', 'reviewer', 'effect'])
-    expect(reviewer).toHaveBeenCalledOnce()
+    expect((await h.execute({ name, arguments: args })).isError).toBe(false)
+    expect(order).toEqual(['human', 'review', 'effect'])
     expect(popup).toHaveBeenCalledOnce()
-    expect(h.effect).toHaveBeenCalledWith('danger-full-access')
-    expectPolicy(h, 'workspace-write')
-    expect(h.builtIn).not.toHaveBeenCalled()
-    expect(h.session.snapshotEvents().filter(event => event.type === 'approval/decided').map(event => event.data)).toEqual([
-      expect.objectContaining({ outcome: 'allowed-once' }),
-    ])
-    await h.execute()
-    expect(h.effect).toHaveBeenLastCalledWith('workspace-write')
-    expect(popup).toHaveBeenCalledOnce()
-    expect(reviewer).toHaveBeenCalledTimes(2)
-  })
-  it('defers an abstaining popup to Auto and grants only the reviewed call', async () => {
-    const h = await harness()
-    popup.mockResolvedValue({ kind: 'no_decision' })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect(popup.mock.calls[0]?.[1]).toMatchObject({ sessionId: h.session.id, toolName: name, args, approval: APPROVAL })
     expect(reviewer).toHaveBeenCalledOnce()
+    expect(reviewer.mock.calls[0]?.[1]).toMatchObject({ name, arguments: args })
+    expect(reviewer.mock.calls[0]?.[3]).toEqual(APPROVAL)
+    expect(args).toEqual(before)
     expect(h.effect).toHaveBeenCalledWith('danger-full-access')
     expect(h.builtIn).not.toHaveBeenCalled()
     expectPolicy(h, 'workspace-write')
-    expect(h.session.snapshotEvents().filter(event => event.type === 'approval/decided').map(event => event.data)).toEqual([
-      expect.objectContaining({ outcome: 'allowed-once' }),
-    ])
-    await h.execute({ arguments: WIDER })
-    expect(reviewer).toHaveBeenCalledTimes(2)
-    expect(popup).toHaveBeenCalledTimes(2)
     await h.execute()
     expect(h.effect).toHaveBeenLastCalledWith('workspace-write')
-    expect(reviewer).toHaveBeenCalledTimes(3)
-    expect(popup).toHaveBeenCalledTimes(2)
-    expect(h.builtIn).not.toHaveBeenCalled()
-  })
-  it.each(['deny', 'failure', 'cancel'] as const)('does not grant an abstaining popup when Auto returns %s', async outcome => {
-    const h = await harness()
-    popup.mockResolvedValue({ kind: 'no_decision' })
-    if (outcome === 'failure') reviewer.mockRejectedValue(new Error('review unavailable'))
-    else if (outcome === 'cancel') reviewer.mockResolvedValue({ kind: 'cancel' })
-    else reviewer.mockResolvedValue({ kind: 'deny', reason: 'review rejected' })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(true)
     expect(reviewer).toHaveBeenCalledOnce()
+    expect(popup).toHaveBeenCalledOnce()
+  })
+
+  it('human allow skips review for only that native request', async () => {
+    const h = await harness()
+    popup.mockResolvedValue({ kind: 'allow' })
+    expect((await h.execute({ name: 'implicit' })).isError).toBe(false)
+    await h.execute()
+    expect(popup).toHaveBeenCalledOnce()
+    expect(reviewer).not.toHaveBeenCalled()
+    expectPolicy(h, 'workspace-write')
+  })
+
+  it.each(['human-deny', 'human-failure', 'review-deny', 'review-failure', 'review-cancel'] as const)('fails closed at %s without native fallback', async gate => {
+    const h = await harness()
+    if (gate === 'human-deny') popup.mockResolvedValue({ kind: 'deny', reason: 'No permission' })
+    if (gate === 'human-failure') popup.mockRejectedValue(new Error('popup unavailable'))
+    if (gate === 'review-deny') reviewer.mockResolvedValue({ kind: 'deny', reason: 'No permission' })
+    if (gate === 'review-failure') reviewer.mockRejectedValue(new Error('review unavailable'))
+    if (gate === 'review-cancel') reviewer.mockResolvedValue({ kind: 'cancel' })
+    expect((await h.execute({ name: 'implicit' })).isError).toBe(true)
     expect(h.effect).not.toHaveBeenCalled()
     expect(h.builtIn).not.toHaveBeenCalled()
     expectPolicy(h, 'workspace-write')
   })
-  it('Authorize skips Auto for that wider call only, not future sandbox calls', async () => {
+
+  it('preserves never without attempting popup or review', async () => {
     const h = await harness()
-    popup.mockResolvedValue({ kind: 'allow' })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
-    expect(reviewer).not.toHaveBeenCalled()
-    expect(h.effect).toHaveBeenCalledWith('danger-full-access')
-    await h.execute()
-    expect(reviewer).toHaveBeenCalledOnce()
-    expect(popup).toHaveBeenCalledOnce()
+    setApprovalPolicy(h.session, 'never')
+    expect((await h.execute({ name: 'implicit' })).isError).toBe(true)
+    expect(h.effect).not.toHaveBeenCalled()
     expect(h.builtIn).not.toHaveBeenCalled()
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).not.toHaveBeenCalled()
+    await h.plugin!.dispose()
+    expectPolicy(h, 'workspace-write', 'never')
   })
-  it('handles read-only to workspace-write as a native strictly wider one-shot grant', async () => {
+
+  it.each([
+    undefined, 'general policy question', 'escalate sandbox to workspace-write: write file',
+    'escalate sandbox to danger-full-access:', 'escalate sandbox to danger-full-access: ',
+    ' escalate sandbox to danger-full-access: reason', 'Escalate sandbox to danger-full-access: reason',
+    'escalate sandbox to danger-full-access : reason',
+  ])('delegates nonmatching reason %j even without a matching dispatch', async reason => {
+    const h = await harness()
+    expect(await h.ctx.approval.request({ agent: h.agent, toolName: 'probe', callId: ToolCallId('missing'), reason })).toBe('allowed-once')
+    expect(h.builtIn).toHaveBeenCalledOnce()
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).not.toHaveBeenCalled()
+  })
+
+  it('leaves read-only to workspace-write native', async () => {
     const h = await harness({ mode: 'read-only' })
     expect((await h.execute({ arguments: { ...WIDER, sandbox_permissions: 'workspace-write' } })).isError).toBe(false)
     expect(h.effect).toHaveBeenCalledWith('workspace-write')
-    expectPolicy(h, 'read-only')
-    expect(popup).toHaveBeenCalledOnce()
-    expect(reviewer).toHaveBeenCalledOnce()
-  })
-  it.each(['human', 'reviewer'] as const)('%s denial prevents the wider effect and built-in approval fallback', async (stage) => {
-    const h = await harness()
-    if (stage === 'human') popup.mockResolvedValue({ kind: 'deny', reason: 'no human authorization' })
-    else reviewer.mockResolvedValue({ kind: 'deny', reason: 'no model authorization' })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(true)
-    expect(h.effect).not.toHaveBeenCalled()
-    expect(h.builtIn).not.toHaveBeenCalled()
-    expect(reviewer).toHaveBeenCalledTimes(stage === 'human' ? 0 : 1)
-    expectPolicy(h, 'workspace-write')
-  })
-  it.each(['human', 'reviewer'] as const)('%s failure denies without falling through to built-in approval', async (stage) => {
-    const h = await harness()
-    if (stage === 'human') popup.mockRejectedValue(new Error('UI failed'))
-    else reviewer.mockRejectedValue(new Error('review failed'))
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(true)
-    expect(h.effect).not.toHaveBeenCalled()
-    expect(h.builtIn).not.toHaveBeenCalled()
-  })
-  it('does not cache grants across calls, including reused call-id after final result', async () => {
-    const h = await harness()
-    popup.mockResolvedValueOnce({ kind: 'allow' }).mockResolvedValueOnce({ kind: 'deny', reason: 'deny second' })
-    const same = { arguments: WIDER, callId: ToolCallId('reused-id') }
-    expect((await h.execute(same)).isError).toBe(false)
-    expect((await h.execute(same)).isError).toBe(true)
-    expect(popup).toHaveBeenCalledTimes(2)
-    expect(h.effect).toHaveBeenCalledOnce()
-  })
-  it.each([
-    { sandbox_permissions: 'workspace-write', justification: 'same mode' },
-    { sandbox_permissions: 'read-only', justification: 'narrower mode' },
-    { sandbox_permissions: 'danger-full-access' },
-    { sandbox_permissions: 'danger-full-access', justification: '' },
-  ])('does not popup for a nonwidening or invalid request %j', async (args) => {
-    const h = await harness()
-    await h.execute({ arguments: args })
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).toHaveBeenCalledOnce()
-    expect(h.builtIn).not.toHaveBeenCalled()
-  })
-  it('rejects unmatched native approval rather than displaying a second built-in dialog', async () => {
-    const h = await harness()
-    expect(await h.ctx.approval.request({ agent: h.agent, toolName: 'probe', callId: ToolCallId('missing') })).toBe('rejected')
+    expect(h.builtIn).toHaveBeenCalledOnce()
     expect(popup).not.toHaveBeenCalled()
     expect(reviewer).not.toHaveBeenCalled()
-    expect(h.builtIn).not.toHaveBeenCalled()
+    expectPolicy(h, 'read-only')
   })
-  it.each(['name', 'call-id', 'agent', 'missing-id'] as const)('rejects a mismatched %s approval during an escalating dispatch', async (mismatch) => {
+
+  it.each(['allow', 'deny', 'ask'] as const)('preserves downstream ordinary %s decisions', async kind => {
+    const h = await harness()
+    h.ctx.on('tools/pre-execute', async (): Promise<PreToolDecision> => kind === 'ask'
+      ? { kind, reason: 'independent policy question' } : kind === 'deny' ? { kind, reason: 'denied' } : { kind })
+    expect((await h.execute()).isError).toBe(kind === 'deny')
+    expect(h.builtIn).toHaveBeenCalledTimes(kind === 'ask' ? 1 : 0)
+    expect(h.effect).toHaveBeenCalledTimes(kind === 'deny' ? 0 : 1)
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).not.toHaveBeenCalled()
+  })
+
+  it('does not install a guard that rejects a later prepended ordinary allow', async () => {
+    const h = await harness()
+    h.ctx.on('tools/pre-execute', async () => ({ kind: 'allow' as const }), { prepend: true })
+    expect((await h.execute()).isError).toBe(false)
+    expect(h.effect).toHaveBeenCalledOnce()
+    expect(reviewer).not.toHaveBeenCalled()
+  })
+
+  it('keeps independent monotonic guards intact', async () => {
+    const h = await harness()
+    h.ctx.tools.guard(() => 'another guard denied')
+    expect((await h.execute({ name: 'implicit' })).isError).toBe(true)
+    expect(h.body).not.toHaveBeenCalled()
+    expect(popup).not.toHaveBeenCalled()
+  })
+
+  it.each(['name', 'call-id', 'agent', 'missing-id'] as const)('rejects full approval with mismatched %s during dispatch', async mismatch => {
     const h = await harness()
     h.body.mockImplementation(async (_args, exec) => {
       const other = { ...h.agent, id: SessionId('different-agent') } as Agent
-      const outcome = await h.ctx.approval.request({
-        agent: mismatch === 'agent' ? other : h.agent,
-        toolName: mismatch === 'name' ? 'different-tool' : exec.name,
-        ...mismatch === 'missing-id' ? {} : { callId: mismatch === 'call-id' ? ToolCallId('different-call') : exec.callId },
-        signal: exec.signal,
-      })
-      expect(outcome).toBe('rejected')
+      expect(await h.ctx.approval.request({
+        ...nativeRequest(h, exec), agent: mismatch === 'agent' ? other : h.agent,
+        toolName: mismatch === 'name' ? 'other-tool' : exec.name,
+        callId: mismatch === 'missing-id' ? undefined : mismatch === 'call-id' ? ToolCallId('other-call') : exec.callId,
+      })).toBe('rejected')
       return []
     })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect((await h.execute()).isError).toBe(false)
     expect(popup).not.toHaveBeenCalled()
     expect(reviewer).not.toHaveBeenCalled()
     expect(h.builtIn).not.toHaveBeenCalled()
   })
-  it('rejects an approval from an ordinary nonwidening dispatch without opening popup', async () => {
+
+  it('rejects a full request without any dispatch and after its result cleaned the record', async () => {
     const h = await harness()
-    h.body.mockImplementation(async (_args, exec) => {
-      expect(await h.ctx.approval.request({ agent: h.agent, toolName: exec.name, callId: exec.callId, signal: exec.signal })).toBe('rejected')
-      return []
-    })
-    expect((await h.execute()).isError).toBe(false)
-    expect(reviewer).toHaveBeenCalledOnce()
+    const callId = ToolCallId('completed')
+    const request = { agent: h.agent, toolName: 'probe', callId, reason: FULL_REASON }
+    expect(await h.ctx.approval.request(request)).toBe('rejected')
+    await h.execute({ callId })
+    expect(await h.ctx.approval.request(request)).toBe('rejected')
     expect(popup).not.toHaveBeenCalled()
     expect(h.builtIn).not.toHaveBeenCalled()
   })
-  it('rejects a native approval before actual dispatch even for a valid wider call', async () => {
+
+  it('rejects matching full approval before dispatch, while ordinary pre-execute ask delegates', async () => {
+    const h = await harness()
+    h.ctx.on('tools/pre-execute', async exec => ({ kind: 'ask', reason: FULL_REASON }))
+    expect((await h.execute()).isError).toBe(true)
+    expect(popup).not.toHaveBeenCalled()
+    expect(h.builtIn).not.toHaveBeenCalled()
+  })
+
+  it('does not mistake the scheduler prepare/dispatch gap for active dispatch', async () => {
     const h = await harness()
     const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
-    const prepared = await scheduler.prepare({ name: 'probe', arguments: WIDER, signal: new AbortController().signal, callId: ToolCallId('prepared'), agent: h.agent })
-    if (prepared.kind !== 'dispatch') throw new Error('Expected deferred-review dispatch')
+    const prepared = await scheduler.prepare({ name: 'implicit', arguments: {}, signal: new AbortController().signal, callId: ToolCallId('prepared'), agent: h.agent })
+    if (prepared.kind !== 'dispatch') throw new Error('Expected prepared dispatch')
     try {
-      expect(await h.ctx.approval.request({ agent: h.agent, toolName: 'probe', callId: prepared.exec.callId })).toBe('rejected')
+      expect(await h.ctx.approval.request(nativeRequest(h, prepared.exec))).toBe('rejected')
       expect(popup).not.toHaveBeenCalled()
     } finally { finishPrepared(h, prepared.exec) }
   })
-  it('rejects an ambiguous in-flight call identity before a second tool can dispatch', async () => {
+
+  it('rejects ambiguous active dispatch identity instead of choosing either execution', async () => {
     const h = await harness()
-    const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
-    const input = { name: 'probe', arguments: WIDER, signal: new AbortController().signal, callId: ToolCallId('shared-live-id'), agent: h.agent }
-    const first = await scheduler.prepare(input)
-    if (first.kind !== 'dispatch') throw new Error('Expected first valid deferred-review dispatch')
-    try {
-      expect((await h.execute(input)).isError).toBe(true)
-      expect(h.body).not.toHaveBeenCalled()
-      expect(popup).not.toHaveBeenCalled()
-    } finally { finishPrepared(h, first.exec) }
-  })
-  it('does not reuse a grant for a second approval from the same dispatch', async () => {
-    const h = await harness()
-    popup.mockResolvedValue({ kind: 'allow' })
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const bothDecided = Promise.withResolvers<void>()
+    let count = 0
+    let decided = 0
     h.body.mockImplementation(async (_args, exec) => {
-      const request = { agent: h.agent, toolName: exec.name, callId: exec.callId, signal: exec.signal }
+      if (++count === 2) entered.resolve()
+      await release.promise
+      expect(await h.ctx.approval.request(nativeRequest(h, exec))).toBe('rejected')
+      if (++decided === 2) bothDecided.resolve()
+      await bothDecided.promise
+      return []
+    })
+    const callId = ToolCallId('ambiguous-live')
+    const first = h.execute({ callId })
+    const second = h.execute({ callId })
+    try { await entered.promise } finally { release.resolve() }
+    expect((await first).isError).toBe(false)
+    expect((await second).isError).toBe(false)
+    expect(popup).not.toHaveBeenCalled()
+    expect(h.builtIn).not.toHaveBeenCalled()
+  })
+
+  it.each(['human', 'reviewer'] as const)('runs a new %s decision for every repeated approval within one dispatch', async stage => {
+    const h = await harness()
+    if (stage === 'human') popup.mockResolvedValueOnce({ kind: 'allow' }).mockResolvedValueOnce({ kind: 'deny', reason: 'second denied' })
+    else reviewer.mockResolvedValueOnce({ kind: 'allow' }).mockResolvedValueOnce({ kind: 'deny', reason: 'second denied' })
+    h.body.mockImplementation(async (_args, exec) => {
+      const request = nativeRequest(h, exec)
       expect(await h.ctx.approval.request(request)).toBe('allowed-once')
       expect(await h.ctx.approval.request(request)).toBe('rejected')
       return []
     })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
-    expect(popup).toHaveBeenCalledOnce()
+    expect((await h.execute()).isError).toBe(false)
+    expect(popup).toHaveBeenCalledTimes(2)
+    expect(reviewer).toHaveBeenCalledTimes(stage === 'human' ? 0 : 2)
     expect(h.builtIn).not.toHaveBeenCalled()
   })
-  it('rejects duplicate simultaneous native approval requests rather than reusing an in-flight decision', async () => {
+
+  it('does not reuse a grant across calls with the same finalised call id', async () => {
+    const h = await harness()
+    popup.mockResolvedValueOnce({ kind: 'allow' }).mockResolvedValueOnce({ kind: 'deny', reason: 'second denied' })
+    const input = { name: 'implicit', callId: ToolCallId('reused') }
+    expect((await h.execute(input)).isError).toBe(false)
+    expect((await h.execute(input)).isError).toBe(true)
+    expect(popup).toHaveBeenCalledTimes(2)
+    expect(h.effect).toHaveBeenCalledOnce()
+  })
+
+  it('rejects concurrent pending approval for the same call without sharing its decision', async () => {
     const h = await harness()
     const entered = Promise.withResolvers<void>()
     const release = Promise.withResolvers<void>()
     popup.mockImplementation(async () => { entered.resolve(); await release.promise; return { kind: 'allow' } })
     h.body.mockImplementation(async (_args, exec) => {
-      const request = { agent: h.agent, toolName: exec.name, callId: exec.callId, signal: exec.signal }
+      const request = nativeRequest(h, exec)
       const first = h.ctx.approval.request(request)
       await entered.promise
       try { expect(await h.ctx.approval.request(request)).toBe('rejected') }
@@ -496,239 +429,171 @@ describe('Auto within the standing sandbox and popup only for native widening ap
       expect(await first).toBe('allowed-once')
       return []
     })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect((await h.execute()).isError).toBe(false)
     expect(popup).toHaveBeenCalledOnce()
     expect(h.builtIn).not.toHaveBeenCalled()
   })
-  it('does not permit a later prepended allow listener to bypass Auto admission', async () => {
-    const h = await harness()
-    h.ctx.on('tools/pre-execute', async () => ({ kind: 'allow' }), { prepend: true })
-    expect((await h.execute()).isError).toBe(true)
-    expect(h.body).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
-  })
-  it.each(['allow', 'deny'] as const)('preserves downstream %s policy without adding a popup', async (decision) => {
-    const h = await harness()
-    h.ctx.on('tools/pre-execute', async (): Promise<PreToolDecision> => decision === 'allow' ? { kind: 'allow' } : { kind: 'deny', reason: 'downstream denied' })
-    expect((await h.execute()).isError).toBe(decision === 'deny')
-    expect(reviewer).toHaveBeenCalledOnce()
-    expect(popup).not.toHaveBeenCalled()
-    expect(h.effect).toHaveBeenCalledTimes(decision === 'allow' ? 1 : 0)
-  })
-  it('denies a downstream ask without creating popup or falling back to built-in UI', async () => {
-    const h = await harness()
-    h.ctx.on('tools/pre-execute', async (): Promise<PreToolDecision> => ({ kind: 'ask', reason: 'independent policy question' }))
-    expect((await h.execute()).isError).toBe(true)
-    expect(reviewer).toHaveBeenCalledOnce()
-    expect(popup).not.toHaveBeenCalled()
-    expect(h.builtIn).not.toHaveBeenCalled()
-    expect(h.body).not.toHaveBeenCalled()
-  })
-  it('rejects an agentless call before any authorization or body', async () => {
-    const h = await harness()
-    expect((await h.execute({ agent: undefined })).isError).toBe(true)
-    expect(reviewer).not.toHaveBeenCalled()
-    expect(popup).not.toHaveBeenCalled()
-    expect(h.body).not.toHaveBeenCalled()
-  })
-  it('still applies independent monotonic guards to an escalating call', async () => {
-    const h = await harness()
-    h.ctx.tools.guard(() => 'another guard denied')
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(true)
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
-    expect(h.body).not.toHaveBeenCalled()
-  })
-  it('rejects standing full access before Auto, popup or tool execution', async () => {
-    const h = await harness()
-    setSandboxMode(h.session, 'danger-full-access')
-    expect((await h.execute()).isError).toBe(true)
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
-    expect(h.body).not.toHaveBeenCalled()
-  })
-  it.each(['human', 'reviewer'] as const)('permission changes permanently cancel a pending %s decision', async (stage) => {
+
+  it.each(['human', 'reviewer'] as const)('permission changes permanently cancel pending %s but not the caller signal', async stage => {
     const h = await harness()
     const entered = Promise.withResolvers<AbortSignal>()
     const release = Promise.withResolvers<void>()
-    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'no_decision' } })
+    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
     else reviewer.mockImplementation(async (_ctx, _exec, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
-    const running = h.execute(stage === 'human' ? { arguments: WIDER } : {})
+    const caller = new AbortController()
+    const running = h.execute({ name: 'implicit', signal: caller.signal })
     const signal = await entered.promise
     setSandboxMode(h.session, 'read-only')
     setSandboxMode(h.session, 'workspace-write')
     expect(signal.aborted).toBe(true)
+    expect(caller.signal.aborted).toBe(false)
     release.resolve()
     expect((await running).isError).toBe(true)
     expect(h.effect).not.toHaveBeenCalled()
     expectPolicy(h, 'workspace-write')
   })
-  it('an approval-policy switch cancels pending human authorization without restoring ask', async () => {
+
+  it('cancels pending approval after approval policy changes without restoring ask', async () => {
     const h = await harness()
     const entered = Promise.withResolvers<AbortSignal>()
     const release = Promise.withResolvers<void>()
     popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
-    const running = h.execute({ arguments: WIDER })
+    const running = h.execute({ name: 'implicit' })
     const signal = await entered.promise
     setApprovalPolicy(h.session, 'never')
     expect(signal.aborted).toBe(true)
     release.resolve()
     expect((await running).isError).toBe(true)
-    expect(h.effect).not.toHaveBeenCalled()
-    expectPolicy(h, 'workspace-write', 'never')
     await h.plugin!.dispose()
     expectPolicy(h, 'workspace-write', 'never')
   })
-  it('rechecks policy changes in an earlier execute wrapper before entering the tool body', async () => {
-    const h = await harness({ enable: false })
-    h.ctx.on('tools/execute', async (_exec, next) => {
-      setSandboxMode(h.session, 'danger-full-access')
-      return next()
+
+  it.each(['caller', 'request'] as const)('links pending cancellation to the %s signal', async source => {
+    const h = await harness()
+    const caller = new AbortController()
+    const request = new AbortController()
+    const entered = Promise.withResolvers<AbortSignal>()
+    const release = Promise.withResolvers<void>()
+    popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
+    h.body.mockImplementation(async (_args, exec) => {
+      expect(await h.ctx.approval.request({ ...nativeRequest(h, exec), signal: request.signal })).not.toBe('allowed-once')
+      return []
     })
-    const plugin = await h.enable()
-    expect((await h.execute()).isError).toBe(true)
-    expect(h.body).not.toHaveBeenCalled()
-    expect(popup).not.toHaveBeenCalled()
-    await plugin.dispose()
-    expectPolicy(h, 'danger-full-access')
+    const running = h.execute({ signal: caller.signal })
+    const signal = await entered.promise
+    ;(source === 'caller' ? caller : request).abort()
+    expect(signal.aborted).toBe(true)
+    release.resolve()
+    await running
+    expect(h.builtIn).not.toHaveBeenCalled()
   })
-  it.each(['human', 'reviewer'] as const)('disposal cancels and drains pending %s before removing enforcement', async (stage) => {
+
+  it.each(['human', 'reviewer'] as const)('disposal aborts and drains only pending %s work', async stage => {
     const h = await harness()
     const entered = Promise.withResolvers<AbortSignal>()
     const release = Promise.withResolvers<void>()
-    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'no_decision' } })
+    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
     else reviewer.mockImplementation(async (_ctx, _exec, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
-    const running = h.execute(stage === 'human' ? { arguments: WIDER } : {})
+    const running = h.execute({ name: 'implicit' })
     const signal = await entered.promise
     const aborted = Promise.withResolvers<void>()
     signal.addEventListener('abort', () => aborted.resolve(), { once: true })
     let disposed = false
     const disposing = h.plugin!.dispose().then(() => { disposed = true })
-    await aborted.promise
-    expect(signal.aborted).toBe(true)
-    expect(disposed).toBe(false)
-    expectPolicy(h, 'workspace-write')
-    release.resolve()
+    try {
+      await aborted.promise
+      expect(disposed).toBe(false)
+      expectPolicy(h, 'workspace-write')
+    } finally { release.resolve() }
     await Promise.all([running, disposing])
     expect(h.effect).not.toHaveBeenCalled()
     expect(disposed).toBe(true)
-    expectPolicy(h, 'workspace-write')
   })
-  it('keeps caller cancellation attached to pending native approval', async () => {
-    const h = await harness()
-    const entered = Promise.withResolvers<void>()
-    const release = Promise.withResolvers<void>()
-    popup.mockImplementation(async () => { entered.resolve(); await release.promise; return { kind: 'allow' } })
-    const controller = new AbortController()
-    const running = h.execute({ arguments: WIDER, signal: controller.signal })
-    await entered.promise
-    controller.abort()
-    release.resolve()
-    expect((await running).isError).toBe(true)
-    expect(h.effect).not.toHaveBeenCalled()
-    expect(h.builtIn).not.toHaveBeenCalled()
-  })
-  it('holds disposal across the real scheduler prepare/dispatch gap until the final result', async () => {
+
+  it('disposes across a prepared gap without waiting for a result or cancelling the queued body', async () => {
     const h = await harness()
     const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
     const prepared = await scheduler.prepare({ name: 'probe', arguments: {}, signal: new AbortController().signal, callId: ToolCallId('queued'), agent: h.agent })
-    if (prepared.kind !== 'dispatch') throw new Error('Expected authorized dispatch')
-    let disposed = false
-    const disposing = h.plugin!.dispose().then(() => { disposed = true })
-    await Promise.resolve()
-    expect(disposed).toBe(false)
-    let finalized = false
+    if (prepared.kind !== 'dispatch') throw new Error('Expected prepared dispatch')
+    await h.plugin!.dispose()
+    expect(prepared.exec.signal.aborted).toBe(false)
     try {
       const dispatched = await scheduler.dispatch(prepared.exec)
-      expect(dispatched.result.isError).toBe(true)
+      expect(dispatched.result.isError).toBe(false)
       if (dispatched.kind === 'post-result') await scheduler.finalize(prepared.exec, dispatched.result)
       else scheduler.finish(prepared.exec, dispatched.result)
-      finalized = true
-    } finally {
-      if (!finalized) finishPrepared(h, prepared.exec)
-      await disposing
-    }
-    expect(h.effect).not.toHaveBeenCalled()
-    expectPolicy(h, 'workspace-write')
+    } finally { finishPrepared(h, prepared.exec) }
+    expect(h.effect).toHaveBeenCalledWith('workspace-write')
   })
-  it('fuses cancellation into actual body and waits for cooperative body settlement', async () => {
+
+  it.each([false, true])('neither cancels nor joins an entered body (already approved=%s)', async approved => {
     const h = await harness()
+    popup.mockResolvedValue({ kind: 'allow' })
     const entered = Promise.withResolvers<AbortSignal>()
     const release = Promise.withResolvers<void>()
-    h.body.mockImplementation(async (_args, exec) => { entered.resolve(exec.signal); await release.promise; return [] })
+    h.body.mockImplementation(async (_args, exec) => {
+      if (approved) expect(await h.ctx.approval.request(nativeRequest(h, exec))).toBe('allowed-once')
+      entered.resolve(exec.signal)
+      await release.promise
+      exec.signal.throwIfAborted()
+      return []
+    })
     const running = h.execute()
     const signal = await entered.promise
-    let disposed = false
-    const disposing = h.plugin!.dispose().then(() => { disposed = true })
-    await Promise.resolve()
-    expect(signal.aborted).toBe(true)
-    expect(disposed).toBe(false)
-    release.resolve()
-    await Promise.all([running, disposing])
-    expect(disposed).toBe(true)
-    expectPolicy(h, 'workspace-write')
+    try {
+      await h.plugin!.dispose()
+      expect(signal.aborted).toBe(false)
+    } finally { release.resolve() }
+    expect((await running).isError).toBe(false)
   })
-  it('does not write native policies when the plugin is removed after an independent selection', async () => {
+
+  it('allows an approved tool body to await its own plugin disposal', async () => {
     const h = await harness()
-    h.ctx.permissionPresets.set(h.session, 'read-only')
-    const before = h.session.snapshotEvents().length
-    await h.plugin!.dispose()
-    expectPolicy(h, 'read-only')
-    expect(h.session.snapshotEvents().length).toBe(before)
+    popup.mockResolvedValue({ kind: 'allow' })
+    h.body.mockImplementation(async (_args, exec) => {
+      expect(await h.ctx.approval.request(nativeRequest(h, exec))).toBe('allowed-once')
+      await h.plugin!.dispose()
+      expect(exec.signal.aborted).toBe(false)
+      return []
+    })
+    expect((await h.execute()).isError).toBe(false)
   })
-  it('refuses nonlocal subprocess activation before changing any policies', async () => {
+
+  it('allows existing and late external providers without restricting registration', async () => {
+    const h = await harness({ external: true })
+    expect(h.ctx.subagents.getProvider('external')).toBeDefined()
+    expect(() => h.ctx.subagents.registerProvider(externalProvider('late'))).not.toThrow()
+    expect(h.ctx.subagents.getProvider('late')).toBeDefined()
+    expect((await h.execute()).isError).toBe(false)
+  })
+
+  it('still requires local subprocess for the native popup', async () => {
     const h = await harness({ enable: false, remoteSubprocess: true })
     await expect(h.enable()).rejects.toThrow('local subprocess provider')
     expectPolicy(h, 'workspace-write')
   })
-  it('refuses existing external providers and rolls back late external provider registration', async () => {
-    const disabled = await harness({ enable: false, external: true })
-    await expect(disabled.enable()).rejects.toThrow('external subagent provider')
-    expectPolicy(disabled, 'workspace-write')
-    const h = await harness()
-    expect(() => h.ctx.subagents.registerProvider(externalProvider('late'))).toThrow('external subagent provider')
-    expect(h.ctx.subagents.getProvider('late')).toBeUndefined()
-    await h.plugin!.dispose()
-    expect(() => h.ctx.subagents.registerProvider(externalProvider('after-disable'))).not.toThrow()
-  })
 })
 
-describe('Composer mode toggle', () => {
-  it('passes every call through the native approval without popup or review while off', async () => {
+describe('Composer mode admission snapshot', () => {
+  it('delegates all native requests while off and restores interception for new calls', async () => {
     const h = await harness()
     await h.setMode(false)
-    popup.mockImplementation(async () => { throw new Error('popup must not run while off') })
-    reviewer.mockImplementation(async () => { throw new Error('reviewer must not run while off') })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
-    expect(h.effect).toHaveBeenCalledWith('danger-full-access')
+    expect((await h.execute({ name: 'implicit' })).isError).toBe(false)
     expect(h.builtIn).toHaveBeenCalledOnce()
-    expectPolicy(h, 'workspace-write')
-    await h.execute()
-    expect(h.effect).toHaveBeenLastCalledWith('workspace-write')
-  })
-
-  it('flipping the mode back on restores popup and review for new calls', async () => {
-    const h = await harness()
-    await h.setMode(false)
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
-    expect(h.builtIn).toHaveBeenCalledOnce()
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).not.toHaveBeenCalled()
     await h.setMode(true)
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect((await h.execute({ name: 'implicit' })).isError).toBe(false)
     expect(popup).toHaveBeenCalledOnce()
     expect(reviewer).toHaveBeenCalledOnce()
     expect(h.builtIn).toHaveBeenCalledOnce()
   })
 
-  it.each([
-    [false, {}], [false, WIDER], [true, {}], [true, WIDER],
-  ] as const)('keeps mode %s for a prepared call with arguments %j after a toggle', async (initial, args) => {
+  it.each([false, true])('keeps entry mode %s across the prepare/dispatch gap', async initial => {
     const h = await harness()
     await h.setMode(initial)
     const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
-    const prepared = await scheduler.prepare({
-      name: 'probe', arguments: args, signal: new AbortController().signal,
-      callId: ToolCallId('toggle-gap'), agent: h.agent,
-    })
+    const prepared = await scheduler.prepare({ name: 'implicit', arguments: {}, signal: new AbortController().signal, callId: ToolCallId('toggle-gap'), agent: h.agent })
     if (prepared.kind !== 'dispatch') throw new Error('Expected prepared dispatch')
     let finalized = false
     try {
@@ -739,90 +604,36 @@ describe('Composer mode toggle', () => {
       finalized = true
       expect(dispatched.result.isError).toBe(false)
       expect(reviewer).toHaveBeenCalledTimes(initial ? 1 : 0)
-      expect(popup).toHaveBeenCalledTimes(initial && args === WIDER ? 1 : 0)
-      expect(h.builtIn).toHaveBeenCalledTimes(!initial && args === WIDER ? 1 : 0)
+      expect(popup).toHaveBeenCalledTimes(initial ? 1 : 0)
+      expect(h.builtIn).toHaveBeenCalledTimes(initial ? 0 : 1)
     } finally { if (!finalized) finishPrepared(h, prepared.exec) }
   })
 
-  it('does not reclassify an off call when enabled during downstream pre-execute', async () => {
-    const h = await harness()
-    await h.setMode(false)
-    h.ctx.on('tools/pre-execute', async (_exec, next) => {
-      await h.setMode(true)
-      return next()
-    })
-    expect((await h.execute()).isError).toBe(false)
-    expect(reviewer).not.toHaveBeenCalled()
-    expect(h.effect).toHaveBeenCalledOnce()
-  })
-
-  it.each([false, true])('keeps mode %s for downstream pre-execute approval across a toggle', async initial => {
+  it.each([false, true])('delegates ordinary pre-execute asks across toggle from %s', async initial => {
     const h = await harness()
     await h.setMode(initial)
-    h.ctx.on('tools/pre-execute', async (): Promise<PreToolDecision> => {
+    h.ctx.on('tools/pre-execute', async () => {
       await h.setMode(!initial)
-      return { kind: 'ask', reason: 'independent policy question' }
+      return { kind: 'ask' as const, reason: 'ordinary question' }
     })
-    expect((await h.execute()).isError).toBe(initial)
-    expect(h.builtIn).toHaveBeenCalledTimes(initial ? 0 : 1)
-    expect(reviewer).toHaveBeenCalledTimes(initial ? 1 : 0)
-    expect(popup).not.toHaveBeenCalled()
-    expect(h.effect).toHaveBeenCalledTimes(initial ? 0 : 1)
-  })
-
-  it('keeps a native approval native when enabled after its body starts', async () => {
-    const h = await harness()
-    await h.setMode(false)
-    const entered = Promise.withResolvers<void>()
-    const release = Promise.withResolvers<void>()
-    const body = h.body.getMockImplementation()!
-    h.body.mockImplementation(async (args, exec) => {
-      entered.resolve()
-      await release.promise
-      return body(args, exec)
-    })
-    const running = h.execute({ arguments: WIDER })
-    try {
-      await entered.promise
-      await h.setMode(true)
-    } finally { release.resolve() }
-    expect((await running).isError).toBe(false)
+    expect((await h.execute()).isError).toBe(false)
     expect(h.builtIn).toHaveBeenCalledOnce()
     expect(popup).not.toHaveBeenCalled()
     expect(reviewer).not.toHaveBeenCalled()
   })
 
-  it('does not reuse native ownership for a later call with the same id', async () => {
+  it('cleans the prior mode snapshot on result before call-id reuse', async () => {
     const h = await harness()
     const callId = ToolCallId('reused-native-id')
     await h.setMode(false)
-    expect((await h.execute({ arguments: WIDER, callId })).isError).toBe(false)
+    expect((await h.execute({ name: 'implicit', callId })).isError).toBe(false)
     await h.setMode(true)
-    expect((await h.execute({ arguments: WIDER, callId })).isError).toBe(false)
+    expect((await h.execute({ name: 'implicit', callId })).isError).toBe(false)
     expect(h.builtIn).toHaveBeenCalledOnce()
     expect(popup).toHaveBeenCalledOnce()
-    expect(reviewer).toHaveBeenCalledOnce()
   })
 
-  it('rejects a managed call that collides with a still-prepared native call', async () => {
-    const h = await harness()
-    await h.setMode(false)
-    const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
-    const callId = ToolCallId('mixed-mode-id')
-    const prepared = await scheduler.prepare({
-      name: 'probe', arguments: WIDER, signal: new AbortController().signal, callId, agent: h.agent,
-    })
-    if (prepared.kind !== 'dispatch') throw new Error('Expected prepared native dispatch')
-    try {
-      await h.setMode(true)
-      expect((await h.execute({ arguments: WIDER, callId })).isError).toBe(true)
-      expect(popup).not.toHaveBeenCalled()
-      expect(reviewer).not.toHaveBeenCalled()
-      expect(h.builtIn).not.toHaveBeenCalled()
-    } finally { finishPrepared(h, prepared.exec) }
-  })
-
-  it('persists the last accepted concurrent toggle through a restart', async () => {
+  it('persists the last concurrent toggle through restart', async () => {
     const h = await harness()
     const results = await Promise.allSettled(Array.from({ length: 20 }, (_, index) => h.setMode(index % 2 === 0)))
     expect(results.every(result => result.status === 'fulfilled')).toBe(true)
@@ -830,32 +641,16 @@ describe('Composer mode toggle', () => {
     await h.plugin!.dispose()
     await h.enable()
     expect(await h.rpcCall('/api/semi-auto.get', {})).toEqual({ enabled: false })
-  })
-
-  it('reports the current mode through the get endpoint', async () => {
-    const h = await harness()
-    await h.setMode(false)
-    expect(await h.rpcCall('/api/semi-auto.get', {})).toEqual({ enabled: false })
-    await h.setMode(true)
-    expect(await h.rpcCall('/api/semi-auto.get', {})).toEqual({ enabled: true })
-  })
-
-  it('rejects a non-boolean set payload and keeps the current mode', async () => {
-    const h = await harness()
-    await expect(h.rpcCall('/api/semi-auto.set', { enabled: 'yes' }))
-      .rejects.toThrow('payload.enabled must be a boolean')
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
-    expect(popup).toHaveBeenCalledOnce()
-  })
-
-  it('survives a plugin restart with the persisted off mode', async () => {
-    const h = await harness()
-    await h.setMode(false)
-    await h.plugin!.dispose()
-    await h.enable()
-    popup.mockImplementation(async () => { throw new Error('popup must not run while off') })
-    expect((await h.execute({ arguments: WIDER })).isError).toBe(false)
+    expect((await h.execute({ name: 'implicit' })).isError).toBe(false)
     expect(h.builtIn).toHaveBeenCalledOnce()
-    expect(h.effect).toHaveBeenCalledWith('danger-full-access')
+    expect(popup).not.toHaveBeenCalled()
+  })
+
+  it('rejects a nonboolean toggle and leaves admission enabled', async () => {
+    const h = await harness()
+    await expect(h.rpcCall('/api/semi-auto.set', { enabled: 'yes' })).rejects.toThrow('payload.enabled must be a boolean')
+    expect(await h.rpcCall('/api/semi-auto.get', {})).toEqual({ enabled: true })
+    expect((await h.execute({ name: 'implicit' })).isError).toBe(false)
+    expect(popup).toHaveBeenCalledOnce()
   })
 })

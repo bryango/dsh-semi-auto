@@ -43,16 +43,23 @@ describe('official reviewer snapshot and deterministic adaptation', () => {
     expect(generated).toContain('export async function reviewTool(')
   })
 
-  it('retains upstream classification and denial code except explicit thinking options', async () => {
+  it('retains upstream classification and denial code except explicit thinking options and native approval facts', async () => {
     const original = (await snapshot()).toString('utf8')
     const generated = await expectedReviewer()
     const classificationStart = '/** Return JSON text for one immutable logged value. */'
     const approvalStart = '/**\n * Ask the user to decide one call the reviewer denied.'
     const retained = original.slice(original.indexOf(classificationStart), original.indexOf(approvalStart))
-    expect(generated).toContain(retained.replace(
+    const adapted = retained.replace(
       '    temperature: 0,\n    signal,',
       "    reasoningEffort: ReasoningEffortId('low'),\n    signal,",
-    ))
+    ).replace(
+      'async function classifyRisk(\n  ctx: Context,\n  agent: Agent,\n  exec: ToolExecution,\n  signal: AbortSignal,\n): Promise<AutoReviewDecision> {',
+      'async function classifyRisk(\n  ctx: Context,\n  agent: Agent,\n  exec: ToolExecution,\n  signal: AbortSignal,\n  approval?: FullAccessApproval,\n): Promise<AutoReviewDecision> {',
+    ).replace(
+      "content: [{ type: 'text', text: reviewUserText(snapshot) }],",
+      "content: [{ type: 'text', text: reviewUserText(snapshot)\n        + (approval === undefined ? '' : '\\n\\nNATIVE_PERMISSION_REQUEST\\n' + json(approval)) }],",
+    )
+    expect(generated).toContain(adapted)
     expect(generated).toContain(original.slice(
       original.indexOf('/** Materialize a reviewer failure as its own error rather than a denial. */'),
       original.indexOf('/** Install the Auto preset and its prepended per-call review gate. */'),

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { tmpdir } from 'node:os'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { FsError } from '@deepseek-ai/dsh-fs'
@@ -32,6 +33,7 @@ const popup = vi.mocked(runPopup)
 const reviewer = vi.mocked(reviewTool)
 const contexts: Context[] = []
 const directories: Array<{ root: string; parent: string }> = []
+const modeHomes: string[] = []
 const CONFIG: SemiAuto.Config = {
   permissionPopupPath: '/test/permission-popup',
   popupTimeoutMs: 600000,
@@ -160,9 +162,11 @@ async function harness(mode: 'read-only' | 'workspace-write' = 'workspace-write'
   return { ctx, session, workspace, outside, execute, body, failures, policies, builtInApproval }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   popup.mockReset().mockResolvedValue({ kind: 'no_decision' })
   reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
+  modeHomes.push(await mkdtemp(join(tmpdir(), 'semi-auto-sandbox-mode-')))
+  process.env.DSH_HOME = modeHomes[modeHomes.length - 1]
 })
 
 afterEach(async () => {
@@ -177,12 +181,14 @@ afterEach(async () => {
       expect(basename(root)).toMatch(/^\.test-sandbox-[A-Za-z0-9]+$/)
       await rm(root, { recursive: true, force: true })
     }
+    delete process.env.DSH_HOME
+    while (modeHomes.length) await rm(modeHomes.pop()!, { recursive: true, force: true })
     vi.restoreAllMocks()
   }
 })
 
 describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
-  it('reviews an actual workspace-local write without opening the popup', async () => {
+  it('passes an actual workspace-local write through without review or popup', async () => {
     const h = await harness()
     const path = join(h.workspace, 'created.txt')
     const result = await h.execute(path, 'workspace content')
@@ -192,11 +198,11 @@ describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
     expect(h.failures).toEqual([])
     expect(h.policies).toEqual([expect.objectContaining({ mode: 'workspace-write', workspaceRoot: h.workspace })])
     expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).toHaveBeenCalledTimes(1)
+    expect(reviewer).not.toHaveBeenCalled()
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
-  it('cannot write inside a read-only workspace after automatic review', async () => {
+  it('cannot write inside a read-only workspace without native full-access approval', async () => {
     const h = await harness('read-only')
     const existing = join(h.workspace, 'existing.txt')
     const missing = join(h.workspace, 'not-created.txt')
@@ -208,7 +214,7 @@ describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
     }
     expect(await readFile(existing, 'utf8')).toBe('original content')
     await expect(stat(missing)).rejects.toMatchObject({ code: 'ENOENT' })
-    // Automatic review reaches the real backend with read-only unchanged.
+    // Ordinary calls reach the real backend with read-only unchanged.
     expect(h.body).toHaveBeenCalledTimes(2)
     expect(h.failures).toHaveLength(2)
     for (const error of h.failures) {
@@ -217,11 +223,11 @@ describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
     }
     expect(h.policies).toEqual(Array.from({ length: 2 }, () => expect.objectContaining({ mode: 'read-only', workspaceRoot: h.workspace })))
     expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).toHaveBeenCalledTimes(2)
+    expect(reviewer).not.toHaveBeenCalled()
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
-  it('cannot bypass the filesystem fence after automatic review', async () => {
+  it('cannot bypass the filesystem fence on an ordinary call', async () => {
     const h = await harness()
     const existing = join(h.outside, 'existing.txt')
     const missing = join(h.outside, 'not-created.txt')
@@ -233,8 +239,8 @@ describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
     }
     expect(await readFile(existing, 'utf8')).toBe('original content')
     await expect(stat(missing)).rejects.toMatchObject({ code: 'ENOENT' })
-    // The body and real backend were reached after approval; enforcement, not an
-    // earlier mocked denial, is what prevented both mutations.
+    // The body reaches the real backend without review; sandbox enforcement,
+    // not an earlier mocked denial, prevents both mutations.
     expect(h.body).toHaveBeenCalledTimes(2)
     expect(h.failures).toHaveLength(2)
     for (const error of h.failures) {
@@ -243,7 +249,7 @@ describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
     }
     expect(h.policies).toEqual(Array.from({ length: 2 }, () => expect.objectContaining({ mode: 'workspace-write', workspaceRoot: h.workspace })))
     expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).toHaveBeenCalledTimes(2)
+    expect(reviewer).not.toHaveBeenCalled()
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
@@ -264,21 +270,22 @@ describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
     expect(await readFile(path, 'utf8')).toBe('one-time write')
     expect(h.policies[1]).toMatchObject({ mode: 'workspace-write' })
     expect(popup).toHaveBeenCalledTimes(1)
-    expect(reviewer).toHaveBeenCalledTimes(kind === 'no_decision' ? 2 : 1)
+    expect(reviewer).toHaveBeenCalledTimes(kind === 'no_decision' ? 1 : 0)
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
-  it('handles read-only to workspace-write as a native one-shot widening', async () => {
+  it('delegates read-only to workspace-write to native approval without popup or review', async () => {
     const h = await harness('read-only')
     const path = join(h.workspace, 'promoted.txt')
     expect((await h.execute(path, 'one-time workspace write', 'workspace-write')).isError).toBe(false)
     expect(await readFile(path, 'utf8')).toBe('one-time workspace write')
     expect(h.ctx.sandboxPolicy.resolve({ session: h.session }).mode).toBe('read-only')
-    expect(popup).toHaveBeenCalledTimes(1)
-    expect(reviewer).toHaveBeenCalledTimes(1)
+    expect(popup).not.toHaveBeenCalled()
+    expect(reviewer).not.toHaveBeenCalled()
+    expect(h.builtInApproval).toHaveBeenCalledOnce()
     expect((await h.execute(path, 'ordinary retry')).isError).toBe(true)
     expect(await readFile(path, 'utf8')).toBe('one-time workspace write')
-    expect(popup).toHaveBeenCalledTimes(1)
+    expect(popup).not.toHaveBeenCalled()
   })
 
   it.each(['human', 'reviewer', 'never'] as const)('rejects elevation at the %s gate before mutation', async (gate) => {

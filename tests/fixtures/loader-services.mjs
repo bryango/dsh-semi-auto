@@ -20,6 +20,8 @@ export const name = 'loader-services-fixture'
 class FixtureState extends Service {
   calls = 0
   reviews = 0
+  reviewRequests = []
+  afterApproval
   session
   constructor(ctx) { super(ctx, 'loaderFixture') }
 }
@@ -29,8 +31,8 @@ class FixtureLlm extends Service {
     super(ctx, 'llm')
     this.countReview = config.countReview
   }
-  async * stream() {
-    this.countReview()
+  async * stream(options) {
+    this.countReview(options)
     const text = '{"risk":"low","decision":"allow"}'
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text }
@@ -81,7 +83,26 @@ export async function apply(ctx, config) {
       return [{ type: 'text', text: 'Loader tool body executed' }]
     },
   }))
-  await ctx.plugin(FixtureLlm, { countReview: () => { state.reviews++ } })
+  ctx.get('tools').register(defineContentToolFixture({
+    name: 'loader_implicit',
+    description: 'Request full access implicitly, then allow the body to update its own Loader entry',
+    parameters: {},
+    execute: async (_args, exec) => {
+      await approveEscalation({
+        requestedMode: 'danger-full-access', justification: 'Test implicit native approval',
+        effectiveMode: ctx.get('sandboxPolicy').resolve({ session: exec.agent.session }).mode,
+        subject: 'operation',
+      }, {
+        approver: ctx.get('approval'), agent: exec.agent, callId: exec.callId,
+        toolName: exec.name, signal: exec.signal,
+      })
+      await state.afterApproval?.(exec)
+      exec.signal.throwIfAborted()
+      state.calls++
+      return [{ type: 'text', text: 'Implicit Loader body completed' }]
+    },
+  }))
+  await ctx.plugin(FixtureLlm, { countReview: options => { state.reviews++; state.reviewRequests.push(options) } })
   // Publish the final required dependency only after the existing session is ready.
   await ctx.plugin(SubagentRuntime, {})
 }

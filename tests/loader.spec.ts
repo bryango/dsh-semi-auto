@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -7,7 +7,8 @@ import { Context } from '@deepseek-ai/cordis'
 import Loader, { type Entry } from '@deepseek-ai/cordis-plugin-loader'
 import Include, { applyEntryPatches, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { createMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { createMessage, ToolCallId, type GenerateOptions } from '@deepseek-ai/dsh-llm'
+import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { SessionId, type Session } from '@deepseek-ai/dsh-session'
 import { parse, stringify } from 'yaml'
 
@@ -17,10 +18,14 @@ const BUILT_PLUGIN = new URL('../lib/index.js', import.meta.url).href
 const SERVICES_FIXTURE = new URL('./fixtures/loader-services.mjs', import.meta.url).href
 const PATCH = new URL('../cordis.patch.yml', import.meta.url)
 const owned: Array<{ ctx: Context; directory: string; parent: string }> = []
+const modeHomes: string[] = []
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    loaderFixture: { session: Session; calls: number; reviews: number }
+    loaderFixture: {
+      session: Session; calls: number; reviews: number; reviewRequests: GenerateOptions[]
+      afterApproval?: (exec: ToolRunContext) => Promise<void>
+    }
   }
 }
 
@@ -32,12 +37,12 @@ async function shippedPatch(): Promise<PatchOptions[]> {
   return parse(await readFile(PATCH, 'utf8')) as PatchOptions[]
 }
 
-async function boot(patches: PatchOptions[] = []) {
+async function boot(patches: PatchOptions[] = [], humanDecision: 'allow' | 'no_decision' = 'allow') {
   const parent = await realpath(tmpdir())
   const directory = await mkdtemp(join(parent, 'dsh-semi-auto-loader-'))
   const popupPath = join(directory, 'permission-popup')
   const requestsPath = join(directory, 'popup-requests.jsonl')
-  const directAllow = JSON.stringify({
+  const directAllow = humanDecision === 'no_decision' ? '' : JSON.stringify({
     hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
   })
   await writeFile(popupPath, [
@@ -45,7 +50,7 @@ async function boot(patches: PatchOptions[] = []) {
     '[ "$1" = "--host" ] && [ "$2" = "dsh" ] || exit 9',
     'IFS= read -r request',
     `printf '%s\\n' "$request" >> ${quoteShell(requestsPath)}`,
-    `printf '%s\\n' ${quoteShell(directAllow)}`,
+    humanDecision === 'no_decision' ? ':' : `printf '%s\\n' ${quoteShell(directAllow)}`,
     '',
   ].join('\n'), { mode: 0o700 })
 
@@ -76,21 +81,22 @@ async function boot(patches: PatchOptions[] = []) {
   expect(ctx.get('loaderFixture'), 'real DSH service fixture must finish mounting').toBeDefined()
 
   let step = 0
-  const execute = (elevated = false) => {
+  const execute = (elevated: boolean | 'implicit' = false) => {
+    const name = elevated === 'implicit' ? 'loader_implicit' : 'loader_probe'
     const session = ctx.loaderFixture.session
     const agent = { id: session.id, session, ctx, options: { provider: 'fixture', model: 'fixture' } } as Agent
     const callId = ToolCallId(`loader-probe-${++step}`)
-    const args = elevated ? { sandbox_permissions: 'danger-full-access', justification: 'Test one native approval' } : {}
+    const args = elevated === true ? { sandbox_permissions: 'danger-full-access', justification: 'Test one native approval' } : {}
     const argumentsJson = JSON.stringify(args)
     if (session.requestHeader() === undefined) {
       session.append('turn/start', { turn: 1 })
       session.append('request/header', {
         header: {
           config: { provider: 'fixture', model: 'fixture' },
-          tools: [{
-            name: 'loader_probe', description: 'Count Loader tool dispatches',
-            parameters: { type: 'object', properties: { sandbox_permissions: { type: 'string' }, justification: { type: 'string' } } },
-          }],
+          tools: ['loader_probe', 'loader_implicit'].map(toolName => {
+            const tool = ctx.tools.get(toolName, agent)!
+            return { name: tool.name, description: tool.description, parameters: tool.parameters }
+          }),
         },
         reason: 'initial',
       })
@@ -100,12 +106,12 @@ async function boot(patches: PatchOptions[] = []) {
       turn: 1, step, stream: [],
       message: createMessage({
         role: 'assistant', source: { kind: 'model', provider: 'fixture', model: 'fixture' },
-        content: [{ type: 'tool-call', id: callId, name: 'loader_probe', arguments: argumentsJson }],
+        content: [{ type: 'tool-call', id: callId, name, arguments: argumentsJson }],
       }),
     }, { surfaceOp: 'append' })
-    session.append('tool/call', { turn: 1, step, callId, name: 'loader_probe', arguments: argumentsJson })
+    session.append('tool/call', { turn: 1, step, callId, name, arguments: argumentsJson })
     return ctx.tools.execute({
-      name: 'loader_probe', arguments: args, callId,
+      name, arguments: args, callId,
       agent, signal: new AbortController().signal,
     })
   }
@@ -123,6 +129,11 @@ function expectPolicy(ctx: Context, session: Session, approval: 'ask' | 'never')
   expect(ctx.approval.overrideOf(session) ?? ctx.approval.config.policy).toBe(approval)
 }
 
+beforeEach(async () => {
+  modeHomes.push(await mkdtemp(join(tmpdir(), 'semi-auto-loader-mode-')))
+  process.env.DSH_HOME = modeHomes[modeHomes.length - 1]
+})
+
 afterEach(async () => {
   while (owned.length) {
     const item = owned.pop()!
@@ -137,6 +148,8 @@ afterEach(async () => {
       await rm(target, { recursive: true, force: true })
     }
   }
+  delete process.env.DSH_HOME
+  while (modeHomes.length) await rm(modeHomes.pop()!, { recursive: true, force: true })
 })
 
 describe('built Semi Auto through real Cordis Loader and Include', () => {
@@ -173,7 +186,7 @@ describe('built Semi Auto through real Cordis Loader and Include', () => {
     expectPolicy(h.ctx, h.ctx.loaderFixture.session, 'ask')
   })
 
-  it('reviews confined calls without popup across enable, disable and re-enable', async () => {
+  it('passes confined calls without popup or review across enable, disable and re-enable', async () => {
     const h = await boot()
     const session = h.ctx.loaderFixture.session
     await enable(h.entry, h.popupPath)
@@ -181,7 +194,7 @@ describe('built Semi Auto through real Cordis Loader and Include', () => {
     const result = await h.execute()
     expect(result.isError, JSON.stringify(result)).toBe(false)
     expect(h.ctx.loaderFixture.calls).toBe(1)
-    expect(h.ctx.loaderFixture.reviews).toBe(1)
+    expect(h.ctx.loaderFixture.reviews).toBe(0)
     await expect(readFile(h.requestsPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
 
     const fiber = h.entry.fiber!
@@ -192,13 +205,13 @@ describe('built Semi Auto through real Cordis Loader and Include', () => {
     expect(h.ctx.permissionPresets.current(session)).toBe('workspace-write')
     expect((await h.execute()).isError).toBe(false)
     expect(h.ctx.loaderFixture.calls).toBe(2)
-    expect(h.ctx.loaderFixture.reviews).toBe(1)
+    expect(h.ctx.loaderFixture.reviews).toBe(0)
 
     await enable(h.entry, h.popupPath)
     expectPolicy(h.ctx, session, 'ask')
     expect((await h.execute()).isError).toBe(false)
     expect(h.ctx.loaderFixture.calls).toBe(3)
-    expect(h.ctx.loaderFixture.reviews).toBe(2)
+    expect(h.ctx.loaderFixture.reviews).toBe(0)
     await expect(readFile(h.requestsPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
     await h.entry.fiber!.dispose()
     expectPolicy(h.ctx, session, 'ask')
@@ -217,11 +230,82 @@ describe('built Semi Auto through real Cordis Loader and Include', () => {
     expect(request).toMatchObject({
       session_id: session.id, hook_event_name: 'PermissionRequest',
       tool_name: 'loader_probe',
-      tool_input: { sandbox_permissions: 'danger-full-access', justification: 'Test one native approval' },
+      tool_input: {
+        native_approval: {
+          requestedMode: 'danger-full-access', reason: 'escalate sandbox to danger-full-access: Test one native approval',
+        },
+        tool_arguments: { sandbox_permissions: 'danger-full-access', justification: 'Test one native approval' },
+      },
     })
     expect((await h.execute()).isError).toBe(false)
     expect(h.ctx.loaderFixture.calls).toBe(2)
-    expect(h.ctx.loaderFixture.reviews).toBe(1)
+    expect(h.ctx.loaderFixture.reviews).toBe(0)
     expect((await readFile(h.requestsPath, 'utf8')).trim().split('\n')).toHaveLength(1)
+  })
+
+  it('presents implicit native approval to the real popup and Auto review without permission arguments', async () => {
+    const h = await boot([], 'no_decision')
+    await enable(h.entry, h.popupPath)
+    const result = await h.execute('implicit')
+    expect(result.isError, JSON.stringify(result)).toBe(false)
+    expect(h.ctx.loaderFixture.calls).toBe(1)
+    expect(h.ctx.loaderFixture.reviews).toBe(1)
+    const approval = {
+      requestedMode: 'danger-full-access', reason: 'escalate sandbox to danger-full-access: Test implicit native approval',
+    }
+    const request = JSON.parse((await readFile(h.requestsPath, 'utf8')).trim())
+    expect(request).toMatchObject({
+      tool_name: 'loader_implicit', tool_input: { native_approval: approval, tool_arguments: {} },
+    })
+    const block = h.ctx.loaderFixture.reviewRequests[0]?.messages[0]?.content[0]
+    if (block?.type !== 'text') throw new Error('Missing real Auto review input')
+    const [action, native] = block.text.split('PENDING_ACTION\n')[1]!.split('\n\nNATIVE_PERMISSION_REQUEST\n')
+    expect(JSON.parse(action!)).toMatchObject({ name: 'loader_implicit', arguments: {}, parameters: { properties: {} } })
+    expect(JSON.parse(native!)).toEqual(approval)
+    expectPolicy(h.ctx, h.ctx.loaderFixture.session, 'ask')
+  })
+
+  it.each(['disable', 'reload'] as const)('an implicitly approved body can await its own real Loader %s without deadlock or signal cancellation', async action => {
+    const h = await boot()
+    await enable(h.entry, h.popupPath)
+    const originalFiber = h.entry.fiber!
+    let continued = false
+    let bodySignal: AbortSignal | undefined
+    h.ctx.loaderFixture.afterApproval = async exec => {
+      bodySignal = exec.signal
+      if (action === 'disable') {
+        await h.entry.update({ disabled: true })
+        await originalFiber.dispose()
+      } else {
+        // Config updates restart the existing Fiber; disposing it would stop
+        // the newly loaded epoch rather than join the configuration reload.
+        await h.entry.update({ config: { permissionPopupPath: h.popupPath, popupTimeoutMs: 300000 } })
+        await originalFiber.await()
+      }
+      await h.entry.parent.tree.await()
+      expect(exec.signal.aborted).toBe(false)
+      continued = true
+    }
+    const result = await h.execute('implicit')
+    expect(result.isError, JSON.stringify(result)).toBe(false)
+    expect(continued).toBe(true)
+    expect(bodySignal?.aborted).toBe(false)
+    expect(h.ctx.loaderFixture.calls).toBe(1)
+    expect(h.ctx.loaderFixture.reviews).toBe(0)
+    expectPolicy(h.ctx, h.ctx.loaderFixture.session, 'ask')
+    if (action === 'disable') {
+      expect(h.entry.disabled).toBe(true)
+      // Entry retains the stopped Fiber handle after disabling.
+      expect(originalFiber.uid).toBeNull()
+      expect(originalFiber.state).toBe(4) // Cordis DISPOSED.
+    } else {
+      expect(h.entry.disabled).toBe(false)
+      expect(h.entry.fiber?.state).toBe(2)
+      expect(h.entry.fiber?.config.popupTimeoutMs).toBe(300000)
+    }
+    const request = JSON.parse((await readFile(h.requestsPath, 'utf8')).trim())
+    expect(request.tool_input).toMatchObject({
+      native_approval: { requestedMode: 'danger-full-access' }, tool_arguments: {},
+    })
   })
 })

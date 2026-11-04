@@ -1,5 +1,35 @@
 # Updating the copied Auto reviewer
 
+## 0.3.0 behavior and upgrade
+
+Version 0.3.0 is a native full-access approval broker, not a reviewer for ordinary tool calls.
+Ordinary calls produce no plugin popup or model review.
+Network operations, remote tool effects, and workspace deletions therefore receive no model review from this plugin unless the native tool requests full access.
+The native tool decides when full access is required; the broker does not classify commands to create extra approvals.
+The official Auto plugin, if selected, retains its own behavior.
+
+Only native reasons with the rc.3/rc.5 shared `approveEscalation` helper's exact prefix,
+`escalate sandbox to danger-full-access: `, followed by a nonempty justification enter the broker.
+This also covers implicit helper requests from `plugin_manager`, without requiring escalation fields in the tool schema or arguments.
+The supported approval API exposes no structured target mode or scope.
+This reason-prefix adapter is version-bound, not a generic detector for every third-party request.
+Unknown reasons, general asks, and read-only → workspace-write requests delegate to the native answerers with `next()`.
+Native `never` still rejects before any answerer.
+
+The plugin does not change persistent sandbox or approval settings, and does not reject ordinary calls in full access or native Auto mode.
+External subagent provider registration is allowed; their own permissions and approval protocols remain outside this broker.
+The popup itself still requires the local subprocess provider.
+The composer toggle applies only to newly admitted calls; pending approvals retain their original path.
+Unloading the entry cancels and waits for pending popup/review work only.
+It neither cancels nor joins an authorized tool body, so a granted `plugin_manager` call can unload or reload the plugin without waiting on itself.
+
+Stop tool work, disable the old entry, and wait for its cleanup before replacing and enabling 0.3.0.
+A popup that already uses empty stdout → Auto review, `allow` → direct authorization, and `deny` → rejection can display the new complete JSON context without a binary upgrade.
+Do not reuse an older binary where `allow` meant Auto review.
+For migrations from the fixed-`never` 0.1.0 implementation, let the old entry restore its managed policies first;
+manually select the intended native preset for older persisted sessions that still contain `never`.
+The new plugin never changes those restrictions to `ask` automatically.
+
 ## Supported baseline
 
 The current development and test baseline is DeepSeek Harness **0.2.1-rc.5**, commit `b830ec950faba0a46dda564be3e2d854afed94f1`.
@@ -15,16 +45,44 @@ Review its public APIs and published dependency types, then run the integration 
 
 [The generator](<scripts/generate-reviewer.mjs>) creates [the runtime reviewer](<src/auto-review.ts>). Do not edit the generated module directly. Its explicit text replacements are the local patch; there is no second hand-maintained reviewer implementation.
 
-The generator retains the upstream first 674 lines except for the module header, unused preset and approval imports, stock plugin exports, the built-in `askUser` helper, and the explicit request-option adaptation below. In particular, it preserves the full policy text, snapshot construction, source-role reconstruction, native/PTC validation, current provider/model selection, stream parser, risk parser, and structured denial/failure rendering. The stock `apply()` and its preset registration/full-access teardown are excluded entirely.
+The generator uses the upstream first 674 lines with explicit local adaptations:
+the module header, unused preset and approval imports, stock plugin exports, the built-in `askUser` helper,
+the request options, and optional native-approval context described below.
+It preserves the complete official policy text, source-role reconstruction, native/PTC validation,
+current provider/model selection, stream parser, risk parser, and structured denial/failure rendering.
+The stock `apply()` and its preset registration/full-access teardown are excluded entirely.
 
-The pinned official reviewer sends `temperature: 0` and omits `reasoningEffort`; it does not explicitly disable thinking. The plugin drops the fixed `temperature` because some provider adapters reject the parameter outright, and requests thinking with low effort by importing `ReasoningEffortId` and sending `reasoningEffort: ReasoningEffortId('low')` through `ctx.llm.stream`. This is the supported `GenerateOptions` field in the pinned LLM API, not a separate `thinking` or `effort` field. The selected provider adapter maps that effort to its model's reasoning controls and applies its own default sampling; the plugin retains the logged provider/model and every other request parameter. A model that does not advertise `low` effort fails closed through the existing reviewer-failure path; the plugin does not silently substitute another effort.
+The pinned official reviewer sends `temperature: 0` and omits `reasoningEffort`; it does not explicitly disable thinking.
+The plugin drops the fixed `temperature` because some provider adapters reject the parameter outright,
+and requests thinking with low effort by importing `ReasoningEffortId` and sending `reasoningEffort: ReasoningEffortId('low')` through `ctx.llm.stream`.
+This is the supported `GenerateOptions` field in the pinned LLM API, not a separate `thinking` or `effort` field.
+The selected provider adapter maps that effort to its model's reasoning controls and applies its own default sampling;
+the plugin retains the logged provider/model and every other request parameter.
+A model that does not advertise `low` effort fails closed through the existing reviewer-failure path;
+the plugin does not silently substitute another effort.
 
 Two adapter exports replace the stock lifecycle:
 
-- `isAutoReviewCandidate(exec)` matches calls with an agent, excluding only the outer `run_code` transport.
-- `reviewTool(ctx, exec, signal)` returns allow, final deny, or cancel. It combines tool and caller cancellation, never asks for approval, and never executes the pending tool. The enclosing plugin owns the popup, downstream delegation, and draining on unload.
+- `isAutoReviewCandidate(exec)` retains the official candidate helper, excluding only the outer `run_code` transport.
+  It does not decide broker admission; ordinary native and inner PTC calls do not invoke the reviewer.
+- `reviewTool(ctx, exec, signal, approval?)` returns allow, final deny, or cancel.
+  It combines tool and caller cancellation, never asks for approval, and never executes the pending tool.
+  The optional `FullAccessApproval` supplies the requested mode and complete native reason as factual context.
+  A separate `NATIVE_PERMISSION_REQUEST` partition is added to the review input without changing the official policy or original tool arguments.
+  The broker calls this adapter only after popup no decision for a matched native full-access request,
+  including an outer `run_code` request when applicable.
+  The enclosing plugin owns the popup and drains pending authorization work, not authorized tool bodies, on unload.
 
-The upstream prompt's statement that an allowed action executes with full host access is intentionally unchanged. It gives the reviewer a conservative risk assumption; it is **not** the actual execution policy. This plugin separately requires the session's native read-only or workspace-write confinement. Copying this prompt neither grants full access nor supplies sandbox enforcement. Direct popup authorization skips this reviewer but not the execution policy or other downstream denials.
+The same optional approval context reaches the popup through `PopupRequest.approval`.
+Its `tool_input` is `{ "native_approval": { "requestedMode": "danger-full-access", "reason": "<complete native reason>" }, "tool_arguments": <original arguments> }`.
+The existing binary can display this complete JSON without understanding the wrapper fields.
+The wrapper changes display and review context only; actual execution arguments remain unchanged.
+
+The upstream prompt's full-host risk assumption is intentionally unchanged.
+Copying this prompt neither grants full access nor supplies sandbox enforcement.
+Native tools and permission settings determine actual execution scope;
+a native `allowed-once` grant can permit the operation outside its original sandbox without changing the session's long-term mode.
+Direct popup authorization skips this reviewer, not other downstream denials.
 
 ## Refresh procedure
 

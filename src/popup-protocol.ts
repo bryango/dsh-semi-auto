@@ -1,4 +1,5 @@
 /** Strict JSON protocol for the native popup's explicit DSH host adapter. */
+import type { FullAccessApproval } from './native-approval.js'
 
 /** Maximum complete stdin payload accepted by permission-popup. */
 export const POPUP_INPUT_LIMIT_BYTES = 8 * 1024 * 1024
@@ -15,6 +16,7 @@ export interface PopupRequest {
   readonly cwd: string
   readonly toolName: string
   readonly args: unknown
+  readonly approval?: FullAccessApproval
 }
 
 /** Exact PermissionRequest envelope supported by the popup's DSH adapter. */
@@ -86,7 +88,12 @@ export function buildPopupPayload(request: PopupRequest): PopupPayload {
     permission_mode: 'auto',
     hook_event_name: 'PermissionRequest',
     tool_name: displayName,
-    tool_input: request.args,
+    // The shipped DSH popup renders unknown input shapes as JSON. Keep native
+    // grant scope separate from actual tool arguments, including implicit asks.
+    tool_input: request.approval === undefined ? request.args : {
+      native_approval: request.approval,
+      tool_arguments: request.args,
+    },
     permission_suggestions: [],
   }
 }

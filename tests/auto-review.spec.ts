@@ -26,6 +26,7 @@ import ToolRuntime, {
 } from '@deepseek-ai/dsh-tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import { isAutoReviewCandidate, reviewTool } from '../src/auto-review.js'
+import type { FullAccessApproval } from '../src/native-approval.js'
 
 const schema: ToolSchema = {
   name: 'probe',
@@ -75,7 +76,7 @@ afterEach(async () => {
   for (const ctx of contexts.splice(0).reverse()) await ctx.fiber.dispose()
 })
 
-async function fixture(response: Response = '{"risk":"low","decision":"allow"}') {
+async function fixture(response: Response = '{"risk":"low","decision":"allow"}', approval?: FullAccessApproval) {
   const ctx = new Context()
   contexts.push(ctx)
   await ctx.plugin(SessionStore)
@@ -110,7 +111,7 @@ async function fixture(response: Response = '{"risk":"low","decision":"allow"}')
   ctx.on('tools/pre-execute', async (exec, next) => {
     executions.push(exec)
     if (!isAutoReviewCandidate(exec)) return next()
-    const decision = await reviewTool(ctx, exec, lifetime.signal)
+    const decision = await reviewTool(ctx, exec, lifetime.signal, approval)
     decisions.push(decision)
     return decision.kind === 'allow' ? next() : decision
   })
@@ -164,7 +165,9 @@ function loggedCall(session: Session, name = schema.name, callId = ToolCallId('p
 function sections(request: GenerateOptions): Record<string, unknown> {
   const body = request.messages[0]?.content[0]
   if (body?.type !== 'text') throw new Error('Missing reviewer text')
-  const labels = ['ENVIRONMENT', 'PROJECT_INSTRUCTIONS', 'FILTERED_HISTORY', 'PENDING_ACTION']
+  const labels = ['ENVIRONMENT', 'PROJECT_INSTRUCTIONS', 'FILTERED_HISTORY', 'PENDING_ACTION',
+    ...body.text.includes('\n\nNATIVE_PERMISSION_REQUEST\n') ? ['NATIVE_PERMISSION_REQUEST'] : [],
+  ]
   return Object.fromEntries(labels.map((label, index) => {
     const start = body.text.indexOf(`${label}\n`)
     if (start < 0) throw new Error(`Missing reviewer section ${label}`)
@@ -206,6 +209,63 @@ describe('adapted official Auto reviewer', () => {
     ])
     expect(JSON.stringify(input)).not.toContain('private assistant reasoning')
     expect(f.ask).not.toHaveBeenCalled()
+  })
+
+  it('adds the real native permission section as the fourth argument while preserving logged schema and arguments', async () => {
+    const approval: FullAccessApproval = {
+      requestedMode: 'danger-full-access',
+      reason: 'escalate sandbox to danger-full-access: Read an implicitly protected project path',
+    }
+    const original = structuredClone(approval)
+    const f = await fixture('{"risk":"low","decision":"allow"}', approval)
+    header(f.session)
+    loggedCall(f.session)
+    expect((await f.execute()).isError).toBe(false)
+    const input = sections(f.adapter.requests[0]!)
+    expect(input.NATIVE_PERMISSION_REQUEST).toEqual(original)
+    expect(input.PENDING_ACTION).toEqual({ mode: 'native', ...schema, arguments: { path: 'inside' } })
+    expect(schema.parameters).not.toHaveProperty('properties.sandbox_permissions')
+    expect(approval).toEqual(original)
+    expect(f.executions[0]?.arguments).toEqual({ path: 'inside' })
+    expect(f.ask).not.toHaveBeenCalled()
+  })
+
+  it('adds native approval scope to a started PTC inner action without changing its arguments', async () => {
+    const approval: FullAccessApproval = {
+      requestedMode: 'danger-full-access', reason: 'escalate sandbox to danger-full-access: PTC implicit operation',
+    }
+    const f = await fixture('{"risk":"low","decision":"allow"}', approval)
+    header(f.session, [])
+    const rootCallId = ToolCallId('outer')
+    const callId = ToolCallId('outer:ptc:0')
+    loggedCall(f.session, RUN_CODE_NAME, rootCallId, '{"code":"probe()"}')
+    f.session.append('tool/ptc-dispatch-start', {
+      rootCallId, parentCallId: rootCallId, subCallId: callId, name: schema.name, arguments: { path: 'inside' },
+    })
+    expect((await f.execute({ rootCallId, callId, parent: Symbol('outer') as ToolExecutionToken, schema })).isError).toBe(false)
+    const input = sections(f.adapter.requests[0]!)
+    expect(input.NATIVE_PERMISSION_REQUEST).toEqual(approval)
+    expect(input.PENDING_ACTION).toEqual({ mode: 'ptc-inner', ...schema, arguments: { path: 'inside' } })
+  })
+
+  it('can review a native full-access ask from the outer run_code transport', async () => {
+    const f = await fixture()
+    const transportSchema = { ...schema, name: RUN_CODE_NAME }
+    header(f.session, [transportSchema])
+    loggedCall(f.session, RUN_CODE_NAME)
+    // Ordinary outer transport is not reviewed by this unit fixture's pre-execute hook.
+    // The plugin instead invokes reviewTool when the native full-access ask arrives.
+    const exec = {
+      agent: f.agent, name: RUN_CODE_NAME, callId: ToolCallId('pending'), rootCallId: ToolCallId('pending'),
+      token: Symbol('outer') as ToolExecutionToken, arguments: { path: 'inside' }, signal: new AbortController().signal,
+    }
+    const approval: FullAccessApproval = {
+      requestedMode: 'danger-full-access', reason: 'escalate sandbox to danger-full-access: Execute the full program',
+    }
+    expect(await reviewTool(f.ctx, exec, f.lifetime.signal, approval)).toEqual({ kind: 'allow' })
+    const input = sections(f.adapter.requests[0]!)
+    expect(input.NATIVE_PERMISSION_REQUEST).toEqual(approval)
+    expect(input.PENDING_ACTION).toEqual({ mode: 'native', ...transportSchema, arguments: { path: 'inside' } })
   })
 
   it('requests low reasoning effort and no fixed temperature', async () => {

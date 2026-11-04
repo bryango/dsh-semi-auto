@@ -24,6 +24,29 @@ describe('popup request protocol', () => {
     expect(encodePopupRequest(request)).toMatch(/\n$/)
   })
 
+  it('shows the complete native approval scope through the existing JSON tool_input without mutating args', () => {
+    const approval = {
+      requestedMode: 'danger-full-access' as const,
+      reason: 'escalate sandbox to danger-full-access: Perform the implicit operation',
+    }
+    const args = { command: 'pwd', native_approval: 'an ordinary argument with the same name' }
+    const original = structuredClone(args)
+    const payload = buildPopupPayload({ ...request, args, approval })
+    expect(payload.tool_input).toEqual({ native_approval: approval, tool_arguments: args })
+    expect(JSON.parse(encodePopupRequest({ ...request, args, approval })).tool_input).toEqual({
+      native_approval: approval, tool_arguments: original,
+    })
+    expect(args).toEqual(original)
+    expect(buildPopupPayload({ ...request, args }).tool_input).toEqual(original)
+  })
+
+  it('includes approval scope even when the implicit tool has no permission arguments', () => {
+    const approval = { requestedMode: 'danger-full-access' as const, reason: 'escalate sandbox to danger-full-access: implicit operation' }
+    expect(buildPopupPayload({ ...request, args: {}, approval }).tool_input).toEqual({
+      native_approval: approval, tool_arguments: {},
+    })
+  })
+
   it.each([['bash', 'Bash'], ['edit', 'Edit'], ['write', 'Write'], ['mcp/server/tool', 'mcp/server/tool']])(
     'maps only presentation names: %s', (toolName, expected) => {
       expect(buildPopupPayload({ ...request, toolName }).tool_name).toBe(expected)

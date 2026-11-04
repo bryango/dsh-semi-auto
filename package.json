@@ -1,7 +1,7 @@
 {
   "name": "dsh-semi-auto",
-  "version": "0.2.0",
-  "description": "Native human approval and official-policy Auto review within the DSH workspace sandbox",
+  "version": "0.3.0",
+  "description": "Native full-access approval broker with a human popup and optional official-policy Auto review for DSH",
   "type": "module",
   "license": "GPL-3.0-only",
   "engines": { "node": ">=24", "dsh": "0.2.1-rc.3 || 0.2.1-rc.5" },

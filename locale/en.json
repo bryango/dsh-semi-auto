@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Semi Auto",
-    "description": "Auto-reviews sandboxed tool calls and opens the human permission popup only for one-shot widening requests. The composer toggle switches it anytime."
+    "description": "Handles supported native one-shot full-access approvals with a human popup and optional Auto review. Ordinary calls are not reviewed; other approvals stay native. The composer toggle applies to new calls."
   }
 }

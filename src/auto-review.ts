@@ -2,12 +2,13 @@
  * Generated from DeepSeek Harness 0.2.1-rc.5 (b830ec950faba0a46dda564be3e2d854afed94f1).
  * Copyright (c) 2026 DeepSeek; MIT license, see vendor/upstream/LICENSE.
  * Do not edit: run scripts/generate-reviewer.mjs. Local adaptation: UPDATING.md.
- * The upstream full-host risk assumption is retained; execution stays sandboxed by the caller.
+ * The upstream full-host risk assumption is retained; native tools determine execution scope.
  * @module dsh-semi-auto/auto-review
  */
 
 import type {} from '@deepseek-ai/dsh-working-directory'
 import type { Context } from '@deepseek-ai/cordis'
+import type { FullAccessApproval } from './native-approval.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-instructions'
 import {
@@ -609,6 +610,7 @@ async function classifyRisk(
   agent: Agent,
   exec: ToolExecution,
   signal: AbortSignal,
+  approval?: FullAccessApproval,
 ): Promise<AutoReviewDecision> {
   const cwd = await ctx.workingDirectory.ensure(agent, signal)
   const snapshot = snapshotAutoReview(agent, exec, cwd)
@@ -619,7 +621,8 @@ async function classifyRisk(
     system: REVIEW_POLICY,
     messages: [{
       role: 'user',
-      content: [{ type: 'text', text: reviewUserText(snapshot) }],
+      content: [{ type: 'text', text: reviewUserText(snapshot)
+        + (approval === undefined ? '' : '\n\nNATIVE_PERMISSION_REQUEST\n' + json(approval)) }],
     }],
     reasoningEffort: ReasoningEffortId('low'),
     signal,
@@ -664,19 +667,21 @@ export function isAutoReviewCandidate(exec: ToolExecution): boolean {
  * @param ctx - context providing the LLM and working-directory services.
  * @param exec - pending tool execution with its durable call history.
  * @param signal - caller's review lifetime; execution cancellation also applies.
+ * @param approval - native full-access grant scope, kept separate from the logged tool arguments.
  * @returns allow, final denial, or cancellation; never an approval request.
  */
 export async function reviewTool(
   ctx: Context,
   exec: ToolExecution,
   signal: AbortSignal,
+  approval?: FullAccessApproval,
 ): Promise<PreToolDecision> {
   const reviewSignal = AbortSignal.any([exec.signal, signal])
   if (isAborted(reviewSignal)) return { kind: 'cancel' }
   const agent = exec.agent
   if (agent === undefined) return failed(exec, new Error('auto-review: the pending call has no agent'))
   try {
-    const decision = await classifyRisk(ctx, agent, exec, reviewSignal)
+    const decision = await classifyRisk(ctx, agent, exec, reviewSignal, approval)
     if (isAborted(reviewSignal)) return { kind: 'cancel' }
     return decision.decision === 'allow' ? { kind: 'allow' } : denied(exec, decision.reason)
   } catch (error: unknown) {

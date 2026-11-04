@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
@@ -17,22 +20,20 @@ import { reviewTool } from '../src/auto-review.js'
 import { runPopup } from '../src/popup-runner.js'
 
 vi.mock('../src/auto-review.js', async (importOriginal) => ({
-  ...await importOriginal<typeof import('../src/auto-review.js')>(),
-  reviewTool: vi.fn(),
+  ...await importOriginal<typeof import('../src/auto-review.js')>(), reviewTool: vi.fn(),
 }))
 vi.mock('../src/popup-runner.js', () => ({ runPopup: vi.fn() }))
-
 const popup = vi.mocked(runPopup)
 const reviewer = vi.mocked(reviewTool)
 const contexts: Context[] = []
+const modeHomes: string[] = []
+const FULL_REASON = 'escalate sandbox to danger-full-access: Test orphan lifecycle authorization'
 
 class FixtureShell extends Service {
   readonly sandboxMode = 'workspace-write'
   constructor(ctx: Context) { super(ctx, 'shell') }
 }
-class FixtureLlm extends Service {
-  constructor(ctx: Context) { super(ctx, 'llm') }
-}
+class FixtureLlm extends Service { constructor(ctx: Context) { super(ctx, 'llm') } }
 class FixtureDirectory extends Service {
   constructor(ctx: Context) { super(ctx, 'workingDirectory') }
   async ensure(agent: Agent, signal: AbortSignal): Promise<string> {
@@ -60,19 +61,27 @@ async function harness() {
   })
   await ctx.plugin(SubagentRuntime, {})
   const session = ctx.sessions.create(SessionId('orphan-owner'), { meta: { cwd: '/workspace' } })
-  // Only external authorization and the Agent driver are synthetic. Preparation,
-  // dispatch, policy folds, lifecycle routing, and plugin disposal are real.
+  session.append('turn/start', { turn: 1 })
+  // Preparation, dispatch, approval, owner routing and disposal use real services.
   const agent = { id: session.id, session, ctx, options: { provider: 'fixture', model: 'fixture' } } as Agent
-  const body = vi.fn(async (_args: unknown, _exec: ToolRunContext) => [{ type: 'text' as const, text: 'executed' }])
+  const effects = vi.fn()
+  const request = (exec: ToolRunContext) => ctx.approval.request({
+    agent, toolName: exec.name, callId: exec.callId, signal: exec.signal, reason: FULL_REASON,
+  })
+  const body = vi.fn(async (_args: unknown, exec: ToolRunContext) => {
+    if (await request(exec) !== 'allowed-once') throw new Error('Native authorization not granted')
+    effects()
+    return [{ type: 'text' as const, text: 'executed' }]
+  })
   ctx.tools.register(defineContentToolFixture({
-    name: 'probe', description: 'A deterministic orphan lifecycle probe', parameters: {}, execute: body,
+    name: 'probe', description: 'An implicit native approval lifecycle probe', parameters: {}, execute: body,
   }))
+  const builtIn = vi.fn(async () => 'allowed-once' as const)
+  ctx.on('approval/request', builtIn)
   const plugin = await ctx.plugin(SemiAuto, {
     permissionPopupPath: '/test/permission-popup', popupTimeoutMs: 600000,
     processGraceMs: 1000, outputLimitBytes: 65536,
   })
-  expect(ctx.approval.overrideOf(session)).toBe('ask')
-  expect(ctx.sandboxPolicy.resolve({ session }).mode).toBe('workspace-write')
   const input = (call: string) => ({
     name: 'probe', arguments: {}, signal: new AbortController().signal,
     callId: ToolCallId(call), agent,
@@ -82,102 +91,103 @@ async function harness() {
     if (event === 'idle') ctx.emit(carrier, 'agent/status', { agent: owner, status: 'idle' })
     else ctx.emit(carrier, 'agent/disposed', { agent: owner })
   }
-  return { ctx, session, agent, body, plugin, input, settle }
+  return { ctx, session, agent, body, effects, builtIn, request, plugin, input, settle }
 }
 
-function nextTurn(): Promise<void> {
-  return new Promise(resolve => setImmediate(resolve))
-}
-
+function nextTurn(): Promise<void> { return new Promise(resolve => setImmediate(resolve)) }
 function whenAborted(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve()
   return new Promise(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
 }
-
-beforeEach(() => {
-  popup.mockReset().mockRejectedValue(new Error('A sandbox-only lifecycle fixture must not open the popup'))
+beforeEach(async () => {
+  popup.mockReset().mockResolvedValue({ kind: 'no_decision' })
   reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
+  modeHomes.push(await mkdtemp(join(tmpdir(), 'semi-auto-orphan-')))
+  process.env.DSH_HOME = modeHomes[modeHomes.length - 1]
 })
-
 afterEach(async () => {
   while (contexts.length) await contexts.pop()!.fiber.dispose()
+  delete process.env.DSH_HOME
+  while (modeHomes.length) await rm(modeHomes.pop()!, { recursive: true, force: true })
   vi.restoreAllMocks()
 })
 
-describe('abandoned scheduler authorization ownership', () => {
-  it.each(['idle', 'disposed'] as const)('releases a prepared slot without tools/result when its exact owner becomes %s', async (event) => {
+describe('native approval ownership when the scheduler owner settles', () => {
+  it.each(['idle', 'disposed'] as const)('cleans an abandoned prepared record on exact owner %s without waiting for tools/result', async event => {
     const h = await harness()
     const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
     const prepared = await scheduler.prepare(h.input('abandoned'))
-    expect(prepared.kind).toBe('dispatch')
-    if (prepared.kind !== 'dispatch') throw new Error('Expected an authorized scheduler slot')
-    const reviewSignal = reviewer.mock.calls[0]![2]
+    if (prepared.kind !== 'dispatch') throw new Error('Expected prepared scheduler slot')
     const results = vi.fn()
     h.ctx.on('tools/result', results)
-    let disposed = false
-    const disposing = h.plugin.dispose().then(() => { disposed = true })
     try {
-      await whenAborted(reviewSignal)
-      await nextTurn()
-      expect(disposed).toBe(false)
-      expect(h.ctx.approval.overrideOf(h.session)).toBe('ask')
-      const unrelated = { ...h.agent, id: SessionId('unrelated') } as Agent
-      h.settle(event, unrelated)
-      await nextTurn()
-      expect(disposed).toBe(false)
-      expect(h.body).not.toHaveBeenCalled()
-      // Model exceptional scheduler abandonment: the rc3 lifecycle contract
-      // guarantees no queued/active driver at idle/disposed. This is not a real
-      // loop exception test, and the abandoned slot is never dispatched later.
       h.settle(event)
-      await disposing
-      expect(disposed).toBe(true)
       expect(results).not.toHaveBeenCalled()
       expect(h.body).not.toHaveBeenCalled()
-      expect(h.ctx.approval.overrideOf(h.session)).toBe('ask')
-      expect(popup).not.toHaveBeenCalled()
-      expect(reviewer).toHaveBeenCalledTimes(1)
+      expect(reviewer).not.toHaveBeenCalled()
+      // Reuse proves the abandoned ownership record no longer creates ambiguity.
+      expect((await h.ctx.tools.execute(h.input('abandoned'))).isError).toBe(false)
+      expect(h.effects).toHaveBeenCalledOnce()
+      expect(popup).toHaveBeenCalledOnce()
+      await h.plugin.dispose()
+      expect(prepared.exec.signal.aborted).toBe(false)
     } finally {
-      h.settle(event)
-      await disposing
+      scheduler.finish(prepared.exec, { content: [], isError: true, error: { message: 'abandoned fixture cleanup' } })
     }
   })
 
-  it.each(['idle', 'disposed'] as const)('still joins an entered body wrapper after a synthetic %s releases admitted records', async (event) => {
+  it.each([
+    ['idle', 'human'], ['idle', 'reviewer'], ['disposed', 'human'], ['disposed', 'reviewer'],
+  ] as const)('owner %s cancels pending %s, but disposal still drains that authorization work', async (event, stage) => {
     const h = await harness()
     const entered = Promise.withResolvers<AbortSignal>()
     const release = Promise.withResolvers<void>()
-    h.body.mockImplementation(async (_args, exec) => {
-      entered.resolve(exec.signal)
-      await release.promise
-      return [{ type: 'text', text: 'settled' }]
-    })
-    const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
-    const abandoned = await scheduler.prepare(h.input('abandoned-beside-active'))
-    expect(abandoned.kind).toBe('dispatch')
-    if (abandoned.kind !== 'dispatch') throw new Error('Expected an authorized scheduler slot')
-    const executing = h.ctx.tools.execute(h.input('active-body'))
-    const bodySignal = await entered.promise
+    if (stage === 'human') popup.mockImplementation(async (_runtime, _request, _config, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
+    else reviewer.mockImplementation(async (_ctx, _exec, signal) => { entered.resolve(signal); await release.promise; return { kind: 'allow' } })
+    const input = h.input('pending')
+    const running = h.ctx.tools.execute(input)
+    const signal = await entered.promise
+    const unrelated = { ...h.agent, id: SessionId('unrelated') } as Agent
+    h.settle(event, unrelated)
+    expect(signal.aborted).toBe(false)
+    h.settle(event)
+    await whenAborted(signal)
+    expect(input.signal.aborted).toBe(false)
     let disposed = false
     const disposing = h.plugin.dispose().then(() => { disposed = true })
     try {
-      await whenAborted(bodySignal)
-      // Deliberately stronger than the real driver contract: even an early
-      // lifecycle announcement must not hide an actual entered body wrapper.
-      h.settle(event)
       await nextTurn()
-      expect(bodySignal.aborted).toBe(true)
       expect(disposed).toBe(false)
+      expect(h.effects).not.toHaveBeenCalled()
       expect(h.ctx.approval.overrideOf(h.session)).toBe('ask')
-      expect(h.body).toHaveBeenCalledTimes(1)
-    } finally {
-      h.settle(event)
-      release.resolve()
-      await Promise.all([executing, disposing])
-    }
+    } finally { release.resolve() }
+    expect((await running).isError).toBe(true)
+    await disposing
     expect(disposed).toBe(true)
-    expect(h.ctx.approval.overrideOf(h.session)).toBe('ask')
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).toHaveBeenCalledTimes(2)
+    expect(h.builtIn).not.toHaveBeenCalled()
+  })
+
+  it.each(['idle', 'disposed'] as const)('owner %s and plugin unload do not abort or join an already approved body', async event => {
+    const h = await harness()
+    popup.mockResolvedValue({ kind: 'allow' })
+    const entered = Promise.withResolvers<AbortSignal>()
+    const release = Promise.withResolvers<void>()
+    h.body.mockImplementation(async (_args, exec) => {
+      expect(await h.request(exec)).toBe('allowed-once')
+      entered.resolve(exec.signal)
+      await release.promise
+      exec.signal.throwIfAborted()
+      return [{ type: 'text', text: 'completed after unload' }]
+    })
+    const running = h.ctx.tools.execute(h.input('approved-body'))
+    const signal = await entered.promise
+    try {
+      h.settle(event)
+      await h.plugin.dispose()
+      expect(signal.aborted).toBe(false)
+    } finally { release.resolve() }
+    expect((await running).isError).toBe(false)
+    expect(popup).toHaveBeenCalledOnce()
+    expect(reviewer).not.toHaveBeenCalled()
   })
 })
