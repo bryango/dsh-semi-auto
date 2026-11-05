@@ -1,4 +1,4 @@
-/** Route native full-access approval requests through the popup and optional Auto review. */
+/** Route native approval requests through the popup and optional Auto review. */
 import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -6,11 +6,11 @@ import { LocalSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-local'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
-import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
+import type { ApprovalOutcome, ApprovalRequestEvent } from '@deepseek-ai/dsh-user-approval/types'
 import type {} from '@deepseek-ai/dsh-working-directory'
-import { reviewTool } from './auto-review.js'
+import { reviewApproval, reviewTool } from './auto-review.js'
 import { readModeFileSync, writeModeFile } from './mode.js'
-import { fullAccessApproval } from './native-approval.js'
+import { nativeApproval } from './native-approval.js'
 import { runPopup } from './popup-runner.js'
 import { registerModeRpc, type ModeRpc } from './rpc.js'
 
@@ -34,10 +34,11 @@ export const Config: z<Config> = z.object({
 
 interface Call {
   enabled: boolean
-  phase: 'preparing' | 'prepared' | 'dispatch'
 }
 
 interface PendingApproval {
+  agent: ApprovalRequestEvent['agent']
+  exec?: ToolExecution
   controller: AbortController
   done: Promise<void>
 }
@@ -45,7 +46,6 @@ interface PendingApproval {
 /** Install an approval answerer without reviewing ordinary calls or changing native permissions. */
 export function apply(ctx: Context, config: Config): void {
   if (!isAbsolute(config.permissionPopupPath)) throw new Error('semi-auto: permissionPopupPath must be absolute')
-  const sandbox = ctx.sandboxPolicy
   const subprocess = ctx.subprocess
   const directory = ctx.workingDirectory
   if (!(subprocess instanceof LocalSubprocessRuntime)) {
@@ -64,23 +64,24 @@ export function apply(ctx: Context, config: Config): void {
   const lifecycle = new AbortController()
   // Admission is fixed per call so a toggle cannot change an already-running call's answerer.
   const calls = new Map<ToolExecution, Call>()
-  const pending = new Map<ToolExecution, PendingApproval>()
-  const audit = (exec: ToolExecution, result: string): void => {
-    ctx.logger.info('semi-auto: session=%s call=%s tool=%s result=%s', exec.agent?.session.id, exec.callId, exec.name, result)
+  const pending = new Map<ApprovalRequestEvent, PendingApproval>()
+  const audit = (request: ApprovalRequestEvent, result: string): void => {
+    ctx.logger.info('semi-auto: session=%s call=%s tool=%s result=%s', request.agent.session.id, request.callId, request.toolName, result)
   }
   const release = (exec: ToolExecution): void => {
     calls.delete(exec)
-    pending.get(exec)?.controller.abort(new Error('Semi Auto owning call settled'))
+    for (const operation of pending.values()) {
+      if (operation.exec === exec) operation.controller.abort(new Error('Semi Auto owning call settled'))
+    }
   }
 
   ctx.effect(function* () {
     yield ctx.on('tools/pre-execute', async (exec, next) => {
-      const call: Call = { enabled, phase: 'preparing' }
+      const call: Call = { enabled }
       calls.set(exec, call)
       try {
         const decision = await next()
-        if (decision.kind === 'allow' || decision.kind === 'ask') call.phase = 'prepared'
-        else calls.delete(exec)
+        if (decision.kind !== 'allow' && decision.kind !== 'ask') calls.delete(exec)
         return decision
       } catch (error) {
         calls.delete(exec)
@@ -88,8 +89,6 @@ export function apply(ctx: Context, config: Config): void {
       }
     }, { prepend: true })
     yield ctx.on('tools/execute', async (exec, next) => {
-      const call = calls.get(exec)
-      if (call !== undefined) call.phase = 'dispatch'
       // Do not fuse the plugin lifetime into the tool signal or join this body on
       // unload: a granted plugin_manager call may itself await this fiber's disposal.
       try {
@@ -103,52 +102,54 @@ export function apply(ctx: Context, config: Config): void {
       for (const exec of calls.keys()) {
         if (exec.agent === agent) release(exec)
       }
+      for (const operation of pending.values()) {
+        if (operation.agent === agent) operation.controller.abort(new Error('Semi Auto owning agent settled'))
+      }
     }
     yield ctx.on('agent/status', ({ agent, status }) => { if (status === 'idle') releaseOwner(agent) })
     yield ctx.on('agent/disposed', ({ agent }) => { releaseOwner(agent) })
     yield ctx.on('session/event', (session, event) => {
       if (event.type !== 'sandbox/mode' && event.type !== 'approval/policy') return
-      for (const [exec, operation] of pending) {
-        if (exec.agent?.session === session) operation.controller.abort(new Error('Semi Auto permissions changed'))
+      for (const operation of pending.values()) {
+        if (operation.agent.session === session) operation.controller.abort(new Error('Semi Auto permissions changed'))
       }
     })
     yield ctx.on('approval/request', async (request, next): Promise<ApprovalOutcome> => {
-      const approval = fullAccessApproval(request.reason)
-      // General asks and read-only -> workspace-write escalation remain native.
-      if (approval === undefined) return next()
+      const approval = nativeApproval(request.reason)
       const matches = [...calls].filter(([exec]) => exec.agent === request.agent
         && exec.callId === request.callId && exec.name === request.toolName)
       if (matches.length === 1 && !matches[0]![1].enabled) return next()
       if (matches.length === 0 && !enabled) return next()
       if (!accepting) return 'cancelled'
-      const match = matches.length === 1 ? matches[0] : undefined
-      if (match === undefined || match[1].phase !== 'dispatch') return 'rejected'
-      const [exec] = match
+      if (matches.length > 1) return 'rejected'
+      const exec = matches[0]?.[0]
       // Concurrent asks cannot borrow a pending decision. A later ask starts a
       // fresh popup/review; no allow is cached or reused across native requests.
-      if (pending.has(exec)) return 'rejected'
-      const mode = sandbox.resolve({ session: request.agent.session }).mode
-      if (mode !== 'read-only' && mode !== 'workspace-write') return 'rejected'
+      if (pending.has(request) || (exec !== undefined
+        && [...pending.values()].some(operation => operation.exec === exec))) return 'rejected'
       const completed = Promise.withResolvers<void>()
       const controller = new AbortController()
-      pending.set(exec, { controller, done: completed.promise })
-      const signal = AbortSignal.any([exec.signal, lifecycle.signal, controller.signal,
+      pending.set(request, { agent: request.agent, exec, controller, done: completed.promise })
+      const signal = AbortSignal.any([lifecycle.signal, controller.signal,
+        ...exec === undefined ? [] : [exec.signal],
         ...request.signal === undefined ? [] : [request.signal]])
       try {
         if (signal.aborted) return 'cancelled'
         const cwd = await directory.ensure(request.agent, signal)
         const human = await runPopup(subprocess, {
-          sessionId: request.agent.session.id, cwd, toolName: exec.name, args: exec.arguments, approval,
+          sessionId: request.agent.session.id, cwd, toolName: request.toolName, args: exec?.arguments, approval,
         }, {
           binaryPath: config.permissionPopupPath, timeoutMs: config.popupTimeoutMs,
           graceMs: config.processGraceMs, outputLimitBytes: config.outputLimitBytes,
         }, signal)
-        audit(exec, `human-${human.kind}`)
+        audit(request, `human-${human.kind}`)
         if (signal.aborted) return 'cancelled'
         if (human.kind === 'deny') return 'rejected'
         if (human.kind === 'no_decision') {
-          const reviewed = await reviewTool(ctx, exec, signal, approval)
-          audit(exec, `auto-${reviewed.kind}`)
+          const reviewed = exec === undefined
+            ? await reviewApproval(ctx, request, signal, approval)
+            : await reviewTool(ctx, exec, signal, approval)
+          audit(request, `auto-${reviewed.kind}`)
           if (signal.aborted || reviewed.kind === 'cancel') return 'cancelled'
           if (reviewed.kind !== 'allow') return 'rejected'
         }
@@ -158,7 +159,7 @@ export function apply(ctx: Context, config: Config): void {
         ctx.logger.warn('semi-auto: approval failed: %s', error instanceof Error ? error.message : String(error))
         return 'rejected'
       } finally {
-        pending.delete(exec)
+        pending.delete(request)
         completed.resolve()
       }
     }, { prepend: true })

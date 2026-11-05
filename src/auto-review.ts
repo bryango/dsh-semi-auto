@@ -2,13 +2,13 @@
  * Generated from DeepSeek Harness 0.2.1-rc.5 (b830ec950faba0a46dda564be3e2d854afed94f1).
  * Copyright (c) 2026 DeepSeek; MIT license, see vendor/upstream/LICENSE.
  * Do not edit: run scripts/generate-reviewer.mjs. Local adaptation: UPDATING.md.
- * The upstream full-host risk assumption is retained; native tools determine execution scope.
+ * Native approval context determines the requested scope; it is not always full host access.
  * @module dsh-semi-auto/auto-review
  */
 
 import type {} from '@deepseek-ai/dsh-working-directory'
 import type { Context } from '@deepseek-ai/cordis'
-import type { FullAccessApproval } from './native-approval.js'
+import type { NativeApproval } from './native-approval.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-instructions'
 import {
@@ -24,6 +24,7 @@ import {
 import { deepFreeze } from '@deepseek-ai/dsh-util-values'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-subagent'
+import type { ApprovalRequestEvent } from '@deepseek-ai/dsh-user-approval/types'
 import {
   RUN_CODE_NAME,
   type PreToolDecision,
@@ -37,7 +38,7 @@ const AUTO_REVIEW_DENIED_CODE = 'AUTO_REVIEW_DENIED'
 
 /** Fixed policy sent as the first of the review request's five sections. */
 const REVIEW_POLICY = `REVIEW_POLICY
-You are the final authorization reviewer for exactly one pending tool call. Your decision replaces human approval for this call. If you allow it, the call executes immediately with full host access and no later confirmation.
+You are the final authorization reviewer for exactly one pending tool call. Your decision replaces human approval for this call. If you allow it, you approve only the native permission request described in NATIVE_PERMISSION_REQUEST. A requestedMode is present only for a recognized native sandbox escalation. Otherwise the scope is unspecified: use the original reason and tool context, and do not assume full host access. This approval does not change the session permission policy.
 
 Return exactly one JSON object and no other text. An allow object has exactly two members, risk and decision, and never has reason. The only valid shapes are:
 {"risk":"low","decision":"allow"}
@@ -610,7 +611,7 @@ async function classifyRisk(
   agent: Agent,
   exec: ToolExecution,
   signal: AbortSignal,
-  approval?: FullAccessApproval,
+  approval?: NativeApproval,
 ): Promise<AutoReviewDecision> {
   const cwd = await ctx.workingDirectory.ensure(agent, signal)
   const snapshot = snapshotAutoReview(agent, exec, cwd)
@@ -667,14 +668,14 @@ export function isAutoReviewCandidate(exec: ToolExecution): boolean {
  * @param ctx - context providing the LLM and working-directory services.
  * @param exec - pending tool execution with its durable call history.
  * @param signal - caller's review lifetime; execution cancellation also applies.
- * @param approval - native full-access grant scope, kept separate from the logged tool arguments.
+ * @param approval - native grant context, kept separate from the logged tool arguments.
  * @returns allow, final denial, or cancellation; never an approval request.
  */
 export async function reviewTool(
   ctx: Context,
   exec: ToolExecution,
   signal: AbortSignal,
-  approval?: FullAccessApproval,
+  approval?: NativeApproval,
 ): Promise<PreToolDecision> {
   const reviewSignal = AbortSignal.any([exec.signal, signal])
   if (isAborted(reviewSignal)) return { kind: 'cancel' }
@@ -686,5 +687,62 @@ export async function reviewTool(
     return decision.decision === 'allow' ? { kind: 'allow' } : denied(exec, decision.reason)
   } catch (error: unknown) {
     return isAborted(reviewSignal) ? { kind: 'cancel' } : failed(exec, error)
+  }
+}
+
+/** Review a public native request that has no uniquely owned ToolExecution. */
+export async function reviewApproval(
+  ctx: Context,
+  request: ApprovalRequestEvent,
+  signal: AbortSignal,
+  approval: NativeApproval,
+): Promise<PreToolDecision> {
+  if (isAborted(signal)) return { kind: 'cancel' }
+  try {
+    const { agent } = request
+    const cwd = await ctx.workingDirectory.ensure(agent, signal)
+    const { session } = agent
+    const header = session.requestHeader()
+    if (header === undefined || !header.config.provider || !header.config.model) {
+      throw new Error('auto-review: no complete request-header route is available')
+    }
+    const events = session.snapshotEvents()
+    const initialPromptSeq = directParentInitialPromptSeq(agent, events)
+    const projectInstructions: HistoricalUserMessage[] = []
+    const history: HistoricalEntry[] = []
+    for (const seq of session.surface.nodes) {
+      const event = events[seq]!
+      if (event.type !== 'user/message' || event.data.source.kind === 'tool') continue
+      if (isProjectInstruction(event.data.source)) {
+        projectInstructions.push({ kind: 'user-message', role: 'constraint',
+          source: event.data.source, content: event.data.content })
+      } else {
+        history.push(...filteredUserEntries(event.seq, event.data.source,
+          event.data.content, initialPromptSeq, session.header.parentSession))
+      }
+    }
+    // No execution means no verified arguments or tool schema. Do not reconstruct
+    // an action from a reused call id, the tool registry, or model-written text.
+    const text = ['ENVIRONMENT', json({ cwd }),
+      'PROJECT_INSTRUCTIONS', json(projectInstructions),
+      'FILTERED_HISTORY', json(history),
+      'PENDING_ACTION', json({ mode: 'approval-request', name: request.toolName,
+        callId: request.callId ?? null, arguments: null, description: null, parameters: null,
+        context: 'No owned ToolExecution is available. Arguments, schema and historical tool facts are unavailable; do not infer them.' }),
+      'NATIVE_PERMISSION_REQUEST', json(approval)].join('\n\n')
+    const options: GenerateOptions = deepFreeze({
+      provider: header.config.provider, model: header.config.model, system: REVIEW_POLICY,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+      reasoningEffort: ReasoningEffortId('low'), signal,
+    })
+    const decision = await readDecision(ctx.llm.stream(options))
+    if (isAborted(signal)) return { kind: 'cancel' }
+    return decision.decision === 'allow' ? { kind: 'allow' }
+      : { kind: 'deny', reason: decision.reason ?? 'Auto review rejected the native permission request.' }
+  } catch (error: unknown) {
+    return isAborted(signal) ? { kind: 'cancel' } : {
+      kind: 'deny', reason: 'Auto review of native permission request failed: '
+        + (error instanceof Error ? error.message : String(error)),
+    }
   }
 }

@@ -25,8 +25,8 @@ import ToolRuntime, {
   type ToolExecutionToken,
 } from '@deepseek-ai/dsh-tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
-import { isAutoReviewCandidate, reviewTool } from '../src/auto-review.js'
-import type { FullAccessApproval } from '../src/native-approval.js'
+import { isAutoReviewCandidate, reviewApproval, reviewTool } from '../src/auto-review.js'
+import type { NativeApproval } from '../src/native-approval.js'
 
 const schema: ToolSchema = {
   name: 'probe',
@@ -76,7 +76,7 @@ afterEach(async () => {
   for (const ctx of contexts.splice(0).reverse()) await ctx.fiber.dispose()
 })
 
-async function fixture(response: Response = '{"risk":"low","decision":"allow"}', approval?: FullAccessApproval) {
+async function fixture(response: Response = '{"risk":"low","decision":"allow"}', approval?: NativeApproval) {
   const ctx = new Context()
   contexts.push(ctx)
   await ctx.plugin(SessionStore)
@@ -178,6 +178,42 @@ function sections(request: GenerateOptions): Record<string, unknown> {
 }
 
 describe('adapted official Auto reviewer', () => {
+  it('reviews a public native request without fabricating execution facts', async () => {
+    const f = await fixture()
+    header(f.session)
+    const human = { kind: 'user' as const, rpcId: 'browser' }
+    user(f.session, 'Human task', human)
+    user(f.session, 'Untrusted text', { kind: 'user' })
+    user(f.session, 'Project constraint', { kind: 'agent-instructions', form: 'instructions', changes: [] })
+    const approval = { reason: 'Independent native question' }
+    expect(await reviewApproval(f.ctx, { agent: f.agent, toolName: 'independent' }, f.lifetime.signal, approval)).toEqual({ kind: 'allow' })
+    const content = f.adapter.requests[0]!.messages[0]!.content[0]!
+    if (content.type !== 'text') throw new Error('Expected review text')
+    expect(content.text).toContain('ENVIRONMENT\n\n{')
+    expect(content.text).toContain('\n\nNATIVE_PERMISSION_REQUEST\n\n{')
+    expect(content.text).not.toContain('\\n\\n')
+    const input = sections(f.adapter.requests[0]!)
+    expect(input.NATIVE_PERMISSION_REQUEST).toEqual(approval)
+    expect(input.PENDING_ACTION).toMatchObject({ mode: 'approval-request', name: 'independent', callId: null,
+      arguments: null, description: null, parameters: null })
+    expect(input.FILTERED_HISTORY).toEqual([
+      expect.objectContaining({ role: 'human-instruction' }), expect.objectContaining({ role: 'fact' }),
+    ])
+    expect(input.PROJECT_INSTRUCTIONS).toEqual([expect.objectContaining({ role: 'constraint' })])
+    expect(f.adapter.requests[0]!.system).toContain('do not assume full host access')
+    expect(f.ask).not.toHaveBeenCalled()
+    expect(f.runs()).toBe(0)
+  })
+
+  it.each(['missing-route', 'invalid-output', 'deny', 'cancel'] as const)('fails closed for public requests: %s', async kind => {
+    const f = await fixture(kind === 'invalid-output' ? 'invalid' : '{"risk":"medium","decision":"deny"}')
+    if (kind !== 'missing-route') header(f.session)
+    if (kind === 'cancel') f.lifetime.abort()
+    const result = await reviewApproval(f.ctx, { agent: f.agent, toolName: 'independent' }, f.lifetime.signal, {})
+    expect(result.kind).toBe(kind === 'cancel' ? 'cancel' : 'deny')
+    expect(f.ask).not.toHaveBeenCalled()
+  })
+
   it('uses the latest logged route and reconstructs native action and source roles', async () => {
     const f = await fixture()
     header(f.session, [schema], 'old-model')
@@ -212,7 +248,7 @@ describe('adapted official Auto reviewer', () => {
   })
 
   it('adds the real native permission section as the fourth argument while preserving logged schema and arguments', async () => {
-    const approval: FullAccessApproval = {
+    const approval: NativeApproval = {
       requestedMode: 'danger-full-access',
       reason: 'escalate sandbox to danger-full-access: Read an implicitly protected project path',
     }
@@ -231,7 +267,7 @@ describe('adapted official Auto reviewer', () => {
   })
 
   it('adds native approval scope to a started PTC inner action without changing its arguments', async () => {
-    const approval: FullAccessApproval = {
+    const approval: NativeApproval = {
       requestedMode: 'danger-full-access', reason: 'escalate sandbox to danger-full-access: PTC implicit operation',
     }
     const f = await fixture('{"risk":"low","decision":"allow"}', approval)
@@ -259,7 +295,7 @@ describe('adapted official Auto reviewer', () => {
       agent: f.agent, name: RUN_CODE_NAME, callId: ToolCallId('pending'), rootCallId: ToolCallId('pending'),
       token: Symbol('outer') as ToolExecutionToken, arguments: { path: 'inside' }, signal: new AbortController().signal,
     }
-    const approval: FullAccessApproval = {
+    const approval: NativeApproval = {
       requestedMode: 'danger-full-access', reason: 'escalate sandbox to danger-full-access: Execute the full program',
     }
     expect(await reviewTool(f.ctx, exec, f.lifetime.signal, approval)).toEqual({ kind: 'allow' })

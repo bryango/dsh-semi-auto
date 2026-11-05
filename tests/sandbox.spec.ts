@@ -274,18 +274,18 @@ describe('Semi Auto with real rc5 sandboxed filesystem execution', () => {
     expect(h.builtInApproval).not.toHaveBeenCalled()
   })
 
-  it('delegates read-only to workspace-write to native approval without popup or review', async () => {
+  it('reviews read-only to workspace-write without changing the standing mode', async () => {
     const h = await harness('read-only')
     const path = join(h.workspace, 'promoted.txt')
     expect((await h.execute(path, 'one-time workspace write', 'workspace-write')).isError).toBe(false)
     expect(await readFile(path, 'utf8')).toBe('one-time workspace write')
     expect(h.ctx.sandboxPolicy.resolve({ session: h.session }).mode).toBe('read-only')
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
-    expect(h.builtInApproval).toHaveBeenCalledOnce()
+    expect(popup).toHaveBeenCalledOnce()
+    expect(reviewer).toHaveBeenCalledOnce()
+    expect(h.builtInApproval).not.toHaveBeenCalled()
     expect((await h.execute(path, 'ordinary retry')).isError).toBe(true)
     expect(await readFile(path, 'utf8')).toBe('one-time workspace write')
-    expect(popup).not.toHaveBeenCalled()
+    expect(popup).toHaveBeenCalledOnce()
   })
 
   it.each(['human', 'reviewer', 'never'] as const)('rejects elevation at the %s gate before mutation', async (gate) => {

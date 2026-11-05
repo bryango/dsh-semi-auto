@@ -1,5 +1,5 @@
 /** Strict JSON protocol for the native popup's explicit DSH host adapter. */
-import type { FullAccessApproval } from './native-approval.js'
+import type { NativeApproval } from './native-approval.js'
 
 /** Maximum complete stdin payload accepted by permission-popup. */
 export const POPUP_INPUT_LIMIT_BYTES = 8 * 1024 * 1024
@@ -16,7 +16,7 @@ export interface PopupRequest {
   readonly cwd: string
   readonly toolName: string
   readonly args: unknown
-  readonly approval?: FullAccessApproval
+  readonly approval?: NativeApproval
 }
 
 /** Exact PermissionRequest envelope supported by the popup's DSH adapter. */
@@ -76,8 +76,14 @@ export function buildPopupPayload(request: PopupRequest): PopupPayload {
   if (request.sessionId.trim() === '' || request.cwd.trim() === '' || request.toolName.trim() === '') {
     throw new Error('Popup request requires a session id, working directory, and tool name.')
   }
-  if (!isRecord(request.args)) throw new Error('Popup tool arguments must be a JSON object.')
-  assertJson(request.args, new Set())
+  // The public native API can ask without a ToolExecution. Null explicitly
+  // means unavailable, not an invented empty argument object.
+  const unavailable = request.approval !== undefined && request.args === undefined
+  const args = unavailable ? null : request.args
+  if (!unavailable) {
+    if (!isRecord(args)) throw new Error('Popup tool arguments must be a JSON object.')
+    assertJson(args, new Set())
+  }
   const displayName = request.toolName === 'bash' ? 'Bash'
     : request.toolName === 'edit' ? 'Edit'
       : request.toolName === 'write' ? 'Write' : request.toolName
@@ -90,9 +96,9 @@ export function buildPopupPayload(request: PopupRequest): PopupPayload {
     tool_name: displayName,
     // The shipped DSH popup renders unknown input shapes as JSON. Keep native
     // grant scope separate from actual tool arguments, including implicit asks.
-    tool_input: request.approval === undefined ? request.args : {
+    tool_input: request.approval === undefined ? args as Record<string, unknown> : {
       native_approval: request.approval,
-      tool_arguments: request.args,
+      tool_arguments: args,
     },
     permission_suggestions: [],
   }

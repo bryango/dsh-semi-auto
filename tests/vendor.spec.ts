@@ -33,7 +33,10 @@ describe('official reviewer snapshot and deterministic adaptation', () => {
   it('matches checked-in generated content without generating files', async () => {
     const generated = await expectedReviewer()
     expect(await readFile(new URL('src/auto-review.ts', root), 'utf8')).toBe(generated)
-    expect(policy(generated)).toBe(policy((await snapshot()).toString('utf8')))
+    expect(policy(generated)).toBe(policy((await snapshot()).toString('utf8')).replace(
+      'If you allow it, the call executes immediately with full host access and no later confirmation.',
+      'If you allow it, you approve only the native permission request described in NATIVE_PERMISSION_REQUEST. A requestedMode is present only for a recognized native sandbox escalation. Otherwise the scope is unspecified: use the original reason and tool context, and do not assume full host access. This approval does not change the session permission policy.',
+    ))
     expect(generated).not.toContain('registerAuto')
     expect(generated).not.toContain('AUTO_PRESET')
     expect(generated).not.toContain('function apply(')
@@ -54,7 +57,7 @@ describe('official reviewer snapshot and deterministic adaptation', () => {
       "    reasoningEffort: ReasoningEffortId('low'),\n    signal,",
     ).replace(
       'async function classifyRisk(\n  ctx: Context,\n  agent: Agent,\n  exec: ToolExecution,\n  signal: AbortSignal,\n): Promise<AutoReviewDecision> {',
-      'async function classifyRisk(\n  ctx: Context,\n  agent: Agent,\n  exec: ToolExecution,\n  signal: AbortSignal,\n  approval?: FullAccessApproval,\n): Promise<AutoReviewDecision> {',
+      'async function classifyRisk(\n  ctx: Context,\n  agent: Agent,\n  exec: ToolExecution,\n  signal: AbortSignal,\n  approval?: NativeApproval,\n): Promise<AutoReviewDecision> {',
     ).replace(
       "content: [{ type: 'text', text: reviewUserText(snapshot) }],",
       "content: [{ type: 'text', text: reviewUserText(snapshot)\n        + (approval === undefined ? '' : '\\n\\nNATIVE_PERMISSION_REQUEST\\n' + json(approval)) }],",

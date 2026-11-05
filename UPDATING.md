@@ -2,18 +2,18 @@
 
 ## 0.3.0 behavior and upgrade
 
-Version 0.3.0 is a native full-access approval broker, not a reviewer for ordinary tool calls.
+Version 0.3.0 is a native approval broker, not a reviewer for ordinary tool calls.
 Ordinary calls produce no plugin popup or model review.
-Network operations, remote tool effects, and workspace deletions therefore receive no model review from this plugin unless the native tool requests full access.
-The native tool decides when full access is required; the broker does not classify commands to create extra approvals.
+Network operations, remote tool effects, and workspace deletions receive no model review from this plugin unless a native approval is requested.
+Native tools and policies decide when approval is required; the broker does not classify commands to create extra approvals.
 The official Auto plugin, if selected, retains its own behavior.
 
-Only native reasons with the rc.3/rc.5 shared `approveEscalation` helper's exact prefix,
-`escalate sandbox to danger-full-access: `, followed by a nonempty justification enter the broker.
+All `approval/request` events enter the broker while enabled, including general asks and requests before dispatch.
+The rc.3/rc.5 `approveEscalation` prefix, `escalate sandbox to <mode>: ` with a nonempty justification, only supplies optional target-mode context.
 This also covers implicit helper requests from `plugin_manager`, without requiring escalation fields in the tool schema or arguments.
 The supported approval API exposes no structured target mode or scope.
-This reason-prefix adapter is version-bound, not a generic detector for every third-party request.
-Unknown reasons, general asks, and read-only → workspace-write requests delegate to the native answerers with `next()`.
+This reason-prefix adapter is version-bound; unknown reasons remain intact without an inferred mode.
+Public requests without a uniquely owned ToolExecution carry unavailable arguments and use the general request reviewer.
 Native `never` still rejects before any answerer.
 
 The plugin does not change persistent sandbox or approval settings, and does not reject ordinary calls in full access or native Auto mode.
@@ -48,7 +48,7 @@ Review its public APIs and published dependency types, then run the integration 
 The generator uses the upstream first 674 lines with explicit local adaptations:
 the module header, unused preset and approval imports, stock plugin exports, the built-in `askUser` helper,
 the request options, and optional native-approval context described below.
-It preserves the complete official policy text, source-role reconstruction, native/PTC validation,
+It preserves the official risk rules, source-role reconstruction, native/PTC validation,
 current provider/model selection, stream parser, risk parser, and structured denial/failure rendering.
 The stock `apply()` and its preset registration/full-access teardown are excluded entirely.
 
@@ -61,24 +61,27 @@ the plugin retains the logged provider/model and every other request parameter.
 A model that does not advertise `low` effort fails closed through the existing reviewer-failure path;
 the plugin does not silently substitute another effort.
 
-Two adapter exports replace the stock lifecycle:
+Three adapter exports replace the stock lifecycle:
 
 - `isAutoReviewCandidate(exec)` retains the official candidate helper, excluding only the outer `run_code` transport.
   It does not decide broker admission; ordinary native and inner PTC calls do not invoke the reviewer.
 - `reviewTool(ctx, exec, signal, approval?)` returns allow, final deny, or cancel.
   It combines tool and caller cancellation, never asks for approval, and never executes the pending tool.
-  The optional `FullAccessApproval` supplies the requested mode and complete native reason as factual context.
-  A separate `NATIVE_PERMISSION_REQUEST` partition is added to the review input without changing the official policy or original tool arguments.
-  The broker calls this adapter only after popup no decision for a matched native full-access request,
+  The optional `NativeApproval` supplies an optional target mode and complete native reason as factual context.
+  A separate `NATIVE_PERMISSION_REQUEST` partition is added without changing original tool arguments.
+  The broker calls this adapter only after popup no decision for a matched native request,
   including an outer `run_code` request when applicable.
   The enclosing plugin owns the popup and drains pending authorization work, not authorized tool bodies, on unload.
+- `reviewApproval(ctx, request, signal, approval)` handles public requests without an owned ToolExecution.
+  It uses the same policy and retained user-role context, but explicitly marks arguments, schema and historical tool facts unavailable.
+  It does not invent an execution or recover arguments by call id.
 
 The same optional approval context reaches the popup through `PopupRequest.approval`.
 Its `tool_input` is `{ "native_approval": { "requestedMode": "danger-full-access", "reason": "<complete native reason>" }, "tool_arguments": <original arguments> }`.
-The existing binary can display this complete JSON without understanding the wrapper fields.
+Both native context fields are optional. Missing execution arguments are represented by `tool_arguments: null`.
 The wrapper changes display and review context only; actual execution arguments remain unchanged.
 
-The upstream prompt's full-host risk assumption is intentionally unchanged.
+The upstream prompt's full-host assumption is replaced by the actual native request scope; risk rules are unchanged.
 Copying this prompt neither grants full access nor supplies sandbox enforcement.
 Native tools and permission settings determine actual execution scope;
 a native `allowed-once` grant can permit the operation outside its original sandbox without changing the session's long-term mode.

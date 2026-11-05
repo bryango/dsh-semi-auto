@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Semi Auto",
-    "description": "Handles supported native one-shot full-access approvals with a human popup and optional Auto review. Ordinary calls are not reviewed; other approvals stay native. The composer toggle applies to new calls."
+    "description": "Handles native approval requests with a human popup and optional Auto review. Calls without approval requests are not reviewed. The composer toggle applies to new calls and unowned requests."
   }
 }

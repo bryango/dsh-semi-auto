@@ -16,6 +16,15 @@ function output(behavior: string, extra: Record<string, unknown> = {}): string {
 }
 
 describe('popup request protocol', () => {
+  it('preserves general reasons and explicitly marks unavailable arguments', () => {
+    expect(buildPopupPayload({ ...request, args: undefined, approval: {} }).tool_input).toEqual({
+      native_approval: {}, tool_arguments: null,
+    })
+    const approval = { reason: 'Approve a general native request' }
+    expect(buildPopupPayload({ ...request, approval }).tool_input).toEqual({
+      native_approval: approval, tool_arguments: request.args,
+    })
+  })
   it('includes only truthful pending-call metadata and exact arguments', () => {
     expect(buildPopupPayload(request)).toEqual({
       session_id: 'session-1', transcript_path: '', cwd: '/workspace', permission_mode: 'auto',

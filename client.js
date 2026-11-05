@@ -21,13 +21,13 @@ window.__ModuleLoader__.load({
 
     const en = {
       label: 'Semi Auto',
-      titleOn: 'Semi Auto is on: supported native full-access requests get the popup, with optional Auto review. Ordinary calls are not reviewed. Click to turn off.',
+      titleOn: 'Semi Auto is on: native approval requests get the popup, with optional Auto review. Calls without approval requests are not reviewed. Click to turn off.',
       titleOff: 'Semi Auto is off for new calls: native approval handles them. Pending approvals keep their current path. Click to turn on.',
       failed: 'Semi Auto status unavailable; retrying.',
     };
     const zh = {
       label: '半自动',
-      titleOn: 'Semi Auto 已开启:受支持的原生 full-access 请求走弹窗，可选 Auto review。普通调用不审核。点击关闭。',
+      titleOn: 'Semi Auto 已开启:原生审批请求走弹窗，可选 Auto review。未请求审批的调用不审核。点击关闭。',
       titleOff: 'Semi Auto 已对新调用关闭:新调用走原生审批，待决审批保留原路径。点击开启。',
       failed: 'Semi Auto 状态读取失败,正在重试。',
     };

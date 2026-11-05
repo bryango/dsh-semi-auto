@@ -1,24 +1,21 @@
 # dsh-semi-auto
 
-在当前 DeepSeek Harness profile 中接管原生一次性 `danger-full-access` 审批，
+在当前 DeepSeek Harness profile 中接管所有原生 `approval/request` 审批，
 通过人工 popup 选择直接授权、Auto review 或拒绝。
-普通工具调用不弹窗、不做模型审核；其他审批继续走原生路径。
+没有原生审批请求的普通工具调用不弹窗、不做模型审核。
 不修改长期 sandbox 或 approval policy，不替换权限服务或子代理服务，也不新增 permission preset。
 
 ## 行为
 
 普通调用直接交给原生工具和其他策略，不弹 popup、不做 Auto review。
-只有工具实际请求原生一次性 `danger-full-access` 审批，且 reason 匹配受支持的原生格式时，才接管。
-是否需要 full access 由原生工具判断，不按命令风险或参数名提前触发。
+工具或策略实际发出原生审批请求时才接管，包括普通 ask 和 sandbox 提权。
+是否需要审批由原生工具和策略判断，不按命令风险或参数名提前触发。
 
 ```text
 普通调用
   → downstream policies → native execution
 
-其他原生审批（含 read-only → workspace-write）
-  → native approval answerers
-
-匹配的原生 danger-full-access 审批
+原生审批（普通 ask、read-only → workspace-write、danger-full-access 等）
   → permission-popup --host dsh
       ├─ Auto review / exit 0 + empty stdout → vendored official Auto reviewer → allow/deny
       ├─ disabled popup / exit 0 + empty stdout → Auto reviewer → allow/deny
@@ -35,13 +32,13 @@
   thinking 由 provider 按该档位启用；不支持时审核失败即拒绝，不静默降级。
   每次审核增加一次 LLM 请求，不提供缓存或自动重试。
 - 人工拒绝、Auto 拒绝和 reviewer 故障均为最终拒绝，不打开内置二次审批。
-  每个后续原生 full-access 请求都要重新决定，不缓存或复用授权。
+  每个后续原生请求都要重新决定，不缓存或复用授权。
 - 工具无需在 schema 或参数中声明 `sandbox_permissions`／`justification` 才能接管。
   `plugin_manager` 等通过相同原生 helper 发出的 full-access 请求也受支持。
   仅在参数里添加这些字段不会弹窗；缺失、无效参数或重复当前 mode 仍由原生工具处理。
 - sandbox 拒绝本身不会自动重试或弹窗；需要重试时，代理须遵守原生工具的提权规则。
 - 普通外层 `run_code` 和 inner tool call 均不审核。
-  若其中某次调用实际请求受支持的 full-access 审批，则针对该调用弹窗；
+  若其中某次调用实际请求原生审批，则针对该调用弹窗；
   外层 `run_code` 的获准范围可能覆盖该次完整程序。
   普通 `run_code` 内直接使用 Node API 的效果仅由原生 PTC sandbox 约束，不逐项审核。
 - 原生 `never` 在审批 answerer 之前直接拒绝，因而不会弹 popup。
@@ -53,17 +50,17 @@
 
 ### 原生审批的兼容范围
 
-支持的 rc.3／rc.5 `approveEscalation` helper 使用固定 reason prefix：
+接管不依赖 reason 格式。支持的 rc.3／rc.5 `approveEscalation` helper 使用以下 reason prefix 来识别目标 mode：
 
 ```text
-'escalate sandbox to danger-full-access: '
+'escalate sandbox to <read-only|workspace-write|danger-full-access>: '
 ```
 
-prefix 后须有非空理由；插件保留并展示完整原生 reason。
+prefix 后须有非空理由；插件保留并展示完整原生 reason，缺失时不编造。
 这两个版本的审批 API 没有结构化 target mode 或 scope，
-因此这是版本绑定的格式适配，不是对所有第三方审批的通用识别。
-未知格式、普通 ask 和 `read-only → workspace-write` 请求均 `next()`，交由原生 answerer 链处理。
-第三方请求若不使用此 helper／格式，不保证由本插件接管；升级 DSH 时须重新核对。
+因此只有目标 mode 的提取是版本绑定的格式适配。
+未知格式和普通 ask 仍接管，但不标记目标 mode，也不假定 full access。
+没有唯一匹配 ToolExecution 的公开请求同样接管；popup 和 reviewer 明确标记参数不可用，不借用旧调用或其他调用的参数。
 
 ### Popup 与 reviewer 上下文
 
@@ -80,10 +77,11 @@ prefix 后须有非空理由；插件保留并展示完整原生 reason。
 ```
 
 这是显示上下文；真实工具执行参数不变。
-已有 binary 可完整展示这份 JSON，无需识别新增字段。
-`reviewTool` 可选接收同一 `FullAccessApproval`，
+`reason` 和 `requestedMode` 均可缺省；参数不可用时 `tool_arguments` 为 `null`。
+`reviewTool` 可选接收同一 `NativeApproval`，
 在额外的 `NATIVE_PERMISSION_REQUEST` 分区中呈现授权目标和完整理由，作为事实输入而不是指令。
-复制的官方 policy 保持不变。
+policy 的风险规则保持不变，但授权范围改为当前原生请求，不再一律假定 full access。
+没有 ToolExecution 时，`reviewApproval` 使用同一 policy 和过滤后的用户上下文，明确说明参数、schema 和历史工具事实不可用。
 
 ### 输入框旁的开关
 
@@ -93,7 +91,7 @@ prefix 后须有非空理由；插件保留并展示完整原生 reason。
 - 关闭时，新调用不做 Auto review、不弹 popup，原生审批 answerer 链原样接管。
   已入场调用及 pending popup/review 保留既有路径，不因开关切换而中断。
 - 切换只影响新进入 pre-execute 的调用；已准备或正在执行的调用保持原有审批路径。
-  开启后新调用恢复上述 full-access broker 行为。
+  开启后新调用恢复上述 broker 行为；无所属调用的请求在请求到达时固定开关状态。
 - 模式持久化在 `$DSH_HOME`（默认 `~/.dsh`）下的
   `plugins/semi-auto/mode.json`；文件缺失或损坏时默认开启。
   并发切换按接收顺序串行写入，避免临时文件冲突和重启后状态回退。
@@ -180,10 +178,10 @@ dsh plugin --profile desktop remove dsh-semi-auto
 
 0.3.0 不再审核普通调用，这是安全行为变化，不只是减少 popup。
 网络操作、远端工具效果和 workspace 内删除等操作，
-如果原生工具不要求 full access，就不会经过本插件的模型审核。
-是否要求 full access 由原生工具判断；本插件不提供通用命令风险扫描或远端权限隔离。
-`read-only → workspace-write` 和其他普通 ask 改回原生审批路径；
-通过共享 helper 发起的隐式 full-access 审批（含 `plugin_manager`）现在可以接管。
+如果原生工具和策略不要求审批，就不会经过本插件的模型审核。
+是否要求审批由原生工具和策略判断；本插件不提供通用命令风险扫描或远端权限隔离。
+当前版本也接管 `read-only → workspace-write`、其他普通 ask 和公开原生请求，
+以及隐式 full-access 审批（含 `plugin_manager`）。
 升级前先停止工具任务、关闭旧 entry 并等待旧版清理，再替换和重新启用。
 
 从旧版 `0.1.0` 的固定 `never` 实现升级时，
@@ -217,7 +215,7 @@ popup 自身的默认队列/窗口 deadline 是 540 秒；其环境变量及托�
 - popup 仍要求本地 subprocess provider，但不再限制外部 subagent provider 的注册。
   Codex／Claude／ACP 等外部 provider 自有的权限和审批不由本插件接管，
   也不保证其工具效果经过 DSH 的本地 sandbox 或本插件审核。
-- 本插件只决定匹配的原生 full-access 审批，不替代其他工具策略。
+- 本插件只决定原生审批请求，不替代其他工具策略。
   同进程恶意插件本来就属于可信宿主代码，不是本插件能隔离的对象。
 - 原生 sandbox 与 approval policy 保持有效，不固定 `never`。
   提权 answerer 需要 `ask`；`never` 仍按原生规则在插件弹窗前拒绝。
@@ -227,7 +225,7 @@ popup 自身的默认队列/窗口 deadline 是 540 秒；其环境变量及托�
   MCP 或其他远端工具的服务端效果不因此被本地文件 sandbox 隔离。
 - 模型审核不保证判断准确。popup 展示原生审批上下文和实际工具参数，
   参数及理由中的文字不能当作可靠指令。
-- 复制的官方 prompt 保留其 full-host 风险假设，policy 不变。
+- 复制的官方 prompt 保留风险分类规则，但授权范围按原生请求呈现。
   实际执行权限仍由原生工具决定；获准提权使用原生工具授予的单次范围。
   源码版本及更新方法见 [UPDATING.md](UPDATING.md)。
 
@@ -248,7 +246,7 @@ PTC inner-call 校验、真实 filesystem workspace/outside-workspace 写入。
 手动验收应在实际已加载插件的 profile 中进行：
 确认普通调用（含 PTC inner call）不做 Auto、不弹窗，sandbox 拒绝不会自动弹窗或重试；
 再提交原生 full-access 请求，分别点击 Auto review、Authorize、Deny，确认审核次数和单次工具效果。
-确认 `never` 下的提权不弹窗而直接拒绝，workspace-write 提权和普通 ask 仍走原生审批。
+确认 `never` 下的提权不弹窗而直接拒绝，workspace-write 提权和普通 ask 均经过 popup。
 确认 popup 同时展示原生完整理由和原始参数，而真实执行参数不变。
 关闭 popup 托盘开关后，full-access 请求不弹窗但必须经过 Auto review；确认审核结果仍决定本次授权。
 切换模式时 pending 审批保留原路径；卸载时 pending 审批取消，但已授权工具不被取消或等待。

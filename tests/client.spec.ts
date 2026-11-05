@@ -17,6 +17,7 @@ async function mountClient() {
   let plugin: { apply(ctx: unknown): void } | undefined
   const register = vi.fn((_options: Registration, _component?: unknown) => () => {})
   const inject = vi.fn((_name: string, setup: () => unknown) => setup())
+  const locale = vi.fn((_namespace: string, _messages: Record<string, { titleOn: string }>) => () => {})
   const call = vi.fn(async (_channel: string, _method: string, _payload: unknown) => ({
     ok: true, value: { enabled: true },
   }))
@@ -36,13 +37,24 @@ async function mountClient() {
   plugin!.apply({
     get: () => ({ rpc: { call } }),
     effect: (setup: () => unknown) => setup(),
-    locale: { register: vi.fn(() => () => {}) },
+    locale: { register: locale },
     slots: { inject, register },
   })
-  return { register, inject, call }
+  return { register, inject, call, locale }
 }
 
 describe('composer client registration', () => {
+  it('describes all native approvals in both tooltip and metadata locales', async () => {
+    const { locale } = await mountClient()
+    const messages = locale.mock.calls[0]![1]
+    expect(messages.en!.titleOn).toContain('native approval requests')
+    expect(messages.zh!.titleOn).toContain('原生审批请求')
+    for (const language of ['en', 'zh']) {
+      expect(messages[language]!.titleOn).not.toContain('full-access')
+      const metadata = JSON.parse(await readFile(new URL(`../locale/${language}.json`, import.meta.url), 'utf8'))
+      expect(metadata.meta.description).not.toContain('full-access')
+    }
+  })
   it('passes the toggle component to register, not to inject', async () => {
     const { register, inject } = await mountClient()
     expect(inject).toHaveBeenCalledWith('conversation.input.left', expect.any(Function))

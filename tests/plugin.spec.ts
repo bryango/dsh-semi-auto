@@ -19,16 +19,17 @@ import ToolRuntime, {
 } from '@deepseek-ai/dsh-tools'
 import ApprovalService, { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import * as SemiAuto from '../src/index.js'
-import { reviewTool } from '../src/auto-review.js'
+import { reviewApproval, reviewTool } from '../src/auto-review.js'
 import { runPopup } from '../src/popup-runner.js'
 
 // Only authorization I/O is mocked; native approval, dispatch and policy services are real.
 vi.mock('../src/auto-review.js', async (importOriginal) => ({
-  ...await importOriginal<typeof import('../src/auto-review.js')>(), reviewTool: vi.fn(),
+  ...await importOriginal<typeof import('../src/auto-review.js')>(), reviewTool: vi.fn(), reviewApproval: vi.fn(),
 }))
 vi.mock('../src/popup-runner.js', () => ({ runPopup: vi.fn() }))
 const popup = vi.mocked(runPopup)
 const reviewer = vi.mocked(reviewTool)
+const requestReviewer = vi.mocked(reviewApproval)
 const contexts: Context[] = []
 const CONFIG: SemiAuto.Config = {
   permissionPopupPath: '/test/permission-popup', popupTimeoutMs: 600000,
@@ -159,6 +160,7 @@ const modeHomes: string[] = []
 beforeEach(async () => {
   popup.mockReset().mockResolvedValue({ kind: 'no_decision' })
   reviewer.mockReset().mockResolvedValue({ kind: 'allow' })
+  requestReviewer.mockReset().mockResolvedValue({ kind: 'allow' })
   modeHomes.push(await mkdtemp(join(tmpdir(), 'semi-auto-plugin-')))
   process.env.DSH_HOME = modeHomes[modeHomes.length - 1]
 })
@@ -169,7 +171,43 @@ afterEach(async () => {
   vi.restoreAllMocks()
 })
 
-describe('only native danger-full-access approval is intercepted', () => {
+describe('all native approval requests are intercepted', () => {
+  it.each(['allow', 'no_decision', 'deny', 'failure'] as const)('handles public requests without call id: %s', async kind => {
+    const h = await harness()
+    if (kind === 'failure') popup.mockRejectedValue(new Error('failed'))
+    else popup.mockResolvedValue(kind === 'deny' ? { kind, reason: 'denied' } : { kind })
+    expect(await h.ctx.approval.request({ agent: h.agent, toolName: 'public' })).toBe(
+      kind === 'deny' || kind === 'failure' ? 'rejected' : 'allowed-once')
+    expect(popup.mock.calls[0]![1]).toMatchObject({ toolName: 'public', approval: {} })
+    expect(popup.mock.calls[0]![1].args).toBeUndefined()
+    expect(requestReviewer).toHaveBeenCalledTimes(kind === 'no_decision' ? 1 : 0)
+    expect(reviewer).not.toHaveBeenCalled()
+    expect(h.builtIn).not.toHaveBeenCalled()
+  })
+
+  it.each(['permissions', 'unload', 'agent', 'signal'] as const)('cancels an unowned request on %s', async kind => {
+    const h = await harness()
+    const entered = Promise.withResolvers<AbortSignal>()
+    const release = Promise.withResolvers<void>()
+    const caller = new AbortController()
+    popup.mockImplementation(async (_runtime, _request, _config, signal) => {
+      entered.resolve(signal); await release.promise; return { kind: 'allow' }
+    })
+    const running = h.ctx.approval.request({ agent: h.agent, toolName: 'public', signal: caller.signal })
+    const signal = await entered.promise
+    let disposing: Promise<void> | undefined
+    if (kind === 'permissions') setSandboxMode(h.session, 'read-only')
+    if (kind === 'unload') disposing = h.plugin!.dispose()
+    if (kind === 'agent') h.ctx.emit('agent/disposed', { agent: h.agent })
+    if (kind === 'signal') caller.abort()
+    await Promise.resolve()
+    expect(signal.aborted).toBe(true)
+    release.resolve()
+    expect(await running).toBe('cancelled')
+    await disposing
+    expect(requestReviewer).not.toHaveBeenCalled()
+  })
+
   it.each(['read-only', 'workspace-write'] as const)('preserves native %s and ask through enable, new session and disable', async mode => {
     const h = await harness({ enable: false, mode })
     const before = h.session.snapshotEvents().length
@@ -272,21 +310,26 @@ describe('only native danger-full-access approval is intercepted', () => {
     'escalate sandbox to danger-full-access:', 'escalate sandbox to danger-full-access: ',
     ' escalate sandbox to danger-full-access: reason', 'Escalate sandbox to danger-full-access: reason',
     'escalate sandbox to danger-full-access : reason',
-  ])('delegates nonmatching reason %j even without a matching dispatch', async reason => {
+  ])('reviews an unowned request with reason %j without guessing tool context', async reason => {
     const h = await harness()
     expect(await h.ctx.approval.request({ agent: h.agent, toolName: 'probe', callId: ToolCallId('missing'), reason })).toBe('allowed-once')
-    expect(h.builtIn).toHaveBeenCalledOnce()
-    expect(popup).not.toHaveBeenCalled()
+    expect(h.builtIn).not.toHaveBeenCalled()
+    expect(popup).toHaveBeenCalledOnce()
+    expect(popup.mock.calls[0]![1].args).toBeUndefined()
+    expect(popup.mock.calls[0]![1].approval?.reason).toBe(reason)
+    expect(requestReviewer).toHaveBeenCalledOnce()
     expect(reviewer).not.toHaveBeenCalled()
   })
 
-  it('leaves read-only to workspace-write native', async () => {
+  it('reviews read-only to workspace-write with its actual native scope', async () => {
     const h = await harness({ mode: 'read-only' })
     expect((await h.execute({ arguments: { ...WIDER, sandbox_permissions: 'workspace-write' } })).isError).toBe(false)
     expect(h.effect).toHaveBeenCalledWith('workspace-write')
-    expect(h.builtIn).toHaveBeenCalledOnce()
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
+    expect(h.builtIn).not.toHaveBeenCalled()
+    expect(popup).toHaveBeenCalledOnce()
+    expect(reviewer).toHaveBeenCalledOnce()
+    expect(popup.mock.calls[0]![1].approval).toEqual({ requestedMode: 'workspace-write',
+      reason: `escalate sandbox to workspace-write: ${WIDER.justification}` })
     expectPolicy(h, 'read-only')
   })
 
@@ -295,10 +338,10 @@ describe('only native danger-full-access approval is intercepted', () => {
     h.ctx.on('tools/pre-execute', async (): Promise<PreToolDecision> => kind === 'ask'
       ? { kind, reason: 'independent policy question' } : kind === 'deny' ? { kind, reason: 'denied' } : { kind })
     expect((await h.execute()).isError).toBe(kind === 'deny')
-    expect(h.builtIn).toHaveBeenCalledTimes(kind === 'ask' ? 1 : 0)
+    expect(h.builtIn).not.toHaveBeenCalled()
     expect(h.effect).toHaveBeenCalledTimes(kind === 'deny' ? 0 : 1)
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
+    expect(popup).toHaveBeenCalledTimes(kind === 'ask' ? 1 : 0)
+    expect(reviewer).toHaveBeenCalledTimes(kind === 'ask' ? 1 : 0)
   })
 
   it('does not install a guard that rejects a later prepended ordinary allow', async () => {
@@ -317,7 +360,7 @@ describe('only native danger-full-access approval is intercepted', () => {
     expect(popup).not.toHaveBeenCalled()
   })
 
-  it.each(['name', 'call-id', 'agent', 'missing-id'] as const)('rejects full approval with mismatched %s during dispatch', async mismatch => {
+  it.each(['name', 'call-id', 'agent', 'missing-id'] as const)('does not borrow arguments for unmatched %s during dispatch', async mismatch => {
     const h = await harness()
     h.body.mockImplementation(async (_args, exec) => {
       const other = { ...h.agent, id: SessionId('different-agent') } as Agent
@@ -325,42 +368,45 @@ describe('only native danger-full-access approval is intercepted', () => {
         ...nativeRequest(h, exec), agent: mismatch === 'agent' ? other : h.agent,
         toolName: mismatch === 'name' ? 'other-tool' : exec.name,
         callId: mismatch === 'missing-id' ? undefined : mismatch === 'call-id' ? ToolCallId('other-call') : exec.callId,
-      })).toBe('rejected')
+      })).toBe('allowed-once')
       return []
     })
     expect((await h.execute()).isError).toBe(false)
-    expect(popup).not.toHaveBeenCalled()
+    expect(popup).toHaveBeenCalledOnce()
+    expect(popup.mock.calls[0]![1].args).toBeUndefined()
+    expect(requestReviewer).toHaveBeenCalledOnce()
     expect(reviewer).not.toHaveBeenCalled()
     expect(h.builtIn).not.toHaveBeenCalled()
   })
 
-  it('rejects a full request without any dispatch and after its result cleaned the record', async () => {
+  it('reviews unowned requests independently before dispatch and after result cleanup', async () => {
     const h = await harness()
     const callId = ToolCallId('completed')
     const request = { agent: h.agent, toolName: 'probe', callId, reason: FULL_REASON }
-    expect(await h.ctx.approval.request(request)).toBe('rejected')
+    expect(await h.ctx.approval.request(request)).toBe('allowed-once')
     await h.execute({ callId })
-    expect(await h.ctx.approval.request(request)).toBe('rejected')
-    expect(popup).not.toHaveBeenCalled()
+    expect(await h.ctx.approval.request(request)).toBe('allowed-once')
+    expect(popup).toHaveBeenCalledTimes(2)
+    expect(requestReviewer).toHaveBeenCalledTimes(2)
     expect(h.builtIn).not.toHaveBeenCalled()
   })
 
-  it('rejects matching full approval before dispatch, while ordinary pre-execute ask delegates', async () => {
+  it('reviews a native pre-dispatch approval without requiring tool execution', async () => {
     const h = await harness()
     h.ctx.on('tools/pre-execute', async exec => ({ kind: 'ask', reason: FULL_REASON }))
-    expect((await h.execute()).isError).toBe(true)
-    expect(popup).not.toHaveBeenCalled()
+    expect((await h.execute()).isError).toBe(false)
+    expect(popup).toHaveBeenCalledOnce()
     expect(h.builtIn).not.toHaveBeenCalled()
   })
 
-  it('does not mistake the scheduler prepare/dispatch gap for active dispatch', async () => {
+  it('supports approvals for prepared calls before dispatch', async () => {
     const h = await harness()
     const scheduler = h.ctx.tools[TOOL_RUNTIME_SCHEDULER]
     const prepared = await scheduler.prepare({ name: 'implicit', arguments: {}, signal: new AbortController().signal, callId: ToolCallId('prepared'), agent: h.agent })
     if (prepared.kind !== 'dispatch') throw new Error('Expected prepared dispatch')
     try {
-      expect(await h.ctx.approval.request(nativeRequest(h, prepared.exec))).toBe('rejected')
-      expect(popup).not.toHaveBeenCalled()
+      expect(await h.ctx.approval.request(nativeRequest(h, prepared.exec))).toBe('allowed-once')
+      expect(popup).toHaveBeenCalledOnce()
     } finally { finishPrepared(h, prepared.exec) }
   })
 
@@ -609,7 +655,7 @@ describe('Composer mode admission snapshot', () => {
     } finally { if (!finalized) finishPrepared(h, prepared.exec) }
   })
 
-  it.each([false, true])('delegates ordinary pre-execute asks across toggle from %s', async initial => {
+  it.each([false, true])('keeps native pre-execute ask admission across toggle from %s', async initial => {
     const h = await harness()
     await h.setMode(initial)
     h.ctx.on('tools/pre-execute', async () => {
@@ -617,9 +663,9 @@ describe('Composer mode admission snapshot', () => {
       return { kind: 'ask' as const, reason: 'ordinary question' }
     })
     expect((await h.execute()).isError).toBe(false)
-    expect(h.builtIn).toHaveBeenCalledOnce()
-    expect(popup).not.toHaveBeenCalled()
-    expect(reviewer).not.toHaveBeenCalled()
+    expect(h.builtIn).toHaveBeenCalledTimes(initial ? 0 : 1)
+    expect(popup).toHaveBeenCalledTimes(initial ? 1 : 0)
+    expect(reviewer).toHaveBeenCalledTimes(initial ? 1 : 0)
   })
 
   it('cleans the prior mode snapshot on result before call-id reuse', async () => {
